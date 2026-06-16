@@ -23,6 +23,11 @@ One sketch, two transports, selected with a single `#define` at the top:
 * Analog (ADC) reporting at the sampling interval, PWM analog writes, extended analog
 * Sampling-interval, string and system-reset messages
 * I2C config / write / read-once / continuous-read / stop (standard Firmata framing)
+* **Scheduler** (SysEx `0x7B`) — store tasks and run them autonomously, even
+  after the client disconnects: create / add / schedule / delay / query / reset,
+  with Encoder7Bit packing and "trailing delay loops the task" (up to 8 tasks,
+  512 bytes each, RAM-only). A queued task keeps running across reconnects; only
+  `SYSTEM_RESET` (or power loss) clears tasks.
 
 The pin map matches a typical ESP32 dev board:
 

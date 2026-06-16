@@ -2,10 +2,16 @@
  * ESP32Firmata.ino  —  Firmata 2.x firmware for the original ESP32
  * ---------------------------------------------------------------------------
  * Self-contained (no external Firmata library) firmware that speaks the
- * Firmata protocol over one of two transports, selected at compile time:
+ * Firmata protocol over BOTH transports at once (set either ENABLE_ define to
+ * 0 to force a single one):
  *
- *   USE_BLE 0 -> Wi-Fi / TCP + Bonjour (mDNS)   ← matches BonjourTransport.swift
- *   USE_BLE 1 -> BLE Nordic UART Service (NUS)   ← matches BLETransport.swift
+ *   ENABLE_WIFI -> Wi-Fi / TCP + Bonjour (mDNS)  ← matches BonjourTransport.swift
+ *   ENABLE_BLE  -> BLE Nordic UART Service (NUS)  ← matches BLETransport.swift
+ *
+ * Only one client controls the board at a time. The policy is LATEST-WINS:
+ * a new connection on either transport evicts the current holder (single Firmata
+ * master — fully standard-compliant, no extra wire bytes). Scheduler tasks are
+ * global and survive eviction/disconnect.
  *
  * It is byte-for-byte compatible with the SwiftFirmataClient package and the
  * "swiftata" macOS app.  Tested wire formats (firmware report, capability,
@@ -36,19 +42,24 @@
 //  USER CONFIGURATION
 // ===========================================================================
 
-#define USE_BLE            0          // 0 = Wi-Fi/Bonjour, 1 = BLE
+#define ENABLE_WIFI        1          // Wi-Fi/TCP + Bonjour   (set 0 to disable)
+#define ENABLE_BLE         1          // BLE Nordic UART Svc   (set 0 to disable)
 
-// --- Wi-Fi / Bonjour settings (used when USE_BLE == 0) ---------------------
+// --- Wi-Fi / Bonjour settings (used when ENABLE_WIFI == 1) -----------------
 #define WIFI_SSID          "YOUR_WIFI_SSID"
 #define WIFI_PASS          "YOUR_WIFI_PASSWORD"
 #define MDNS_HOSTNAME      "esp32-firmata"   // also the Bonjour instance name
 #define FIRMATA_TCP_PORT   3030              // must match BonjourTransport default
 
-// --- BLE settings (used when USE_BLE == 1) --------------------------------
+// --- BLE settings (used when ENABLE_BLE == 1) -----------------------------
 #define BLE_DEVICE_NAME    "Firmata-ESP32"   // optional name filter in the app
 
+#if !ENABLE_WIFI && !ENABLE_BLE
+#error "Enable at least one transport (ENABLE_WIFI and/or ENABLE_BLE)."
+#endif
+
 // --- Firmware identity (shown in the app header) --------------------------
-#define FIRMWARE_NAME      "Swiftata"
+#define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
 #define FIRMWARE_MINOR     8
 #define PROTOCOL_MAJOR     2
@@ -66,14 +77,15 @@
 // ===========================================================================
 //  Transport-specific includes
 // ===========================================================================
-#if USE_BLE
+#if ENABLE_WIFI
+  #include <WiFi.h>
+  #include <ESPmDNS.h>
+#endif
+#if ENABLE_BLE
   #include <BLEDevice.h>
   #include <BLEServer.h>
   #include <BLEUtils.h>
   #include <BLE2902.h>
-#else
-  #include <WiFi.h>
-  #include <ESPmDNS.h>
 #endif
 #include <Wire.h>
 
@@ -104,6 +116,20 @@ static const uint8_t I2C_REPLY               = 0x77;
 static const uint8_t I2C_CONFIG              = 0x78;
 static const uint8_t REPORT_FIRMWARE         = 0x79;
 static const uint8_t SAMPLING_INTERVAL       = 0x7A;
+static const uint8_t SCHEDULER_DATA          = 0x7B;
+
+// Scheduler sub-commands (first payload byte after SCHEDULER_DATA)
+static const uint8_t SCHED_CREATE          = 0x00;
+static const uint8_t SCHED_DELETE          = 0x01;
+static const uint8_t SCHED_ADD             = 0x02;
+static const uint8_t SCHED_DELAY           = 0x03;
+static const uint8_t SCHED_SCHEDULE        = 0x04;
+static const uint8_t SCHED_QUERY_ALL       = 0x05;
+static const uint8_t SCHED_QUERY           = 0x06;
+static const uint8_t SCHED_RESET           = 0x07;
+static const uint8_t SCHED_ERROR_REPLY     = 0x08;
+static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
+static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
 
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
@@ -127,6 +153,39 @@ static const uint8_t NUM_ANALOG    = sizeof(ANALOG_PINS) / sizeof(ANALOG_PINS[0]
 // Default I2C pins on the original ESP32.
 static const uint8_t I2C_SDA_PIN = 21;
 static const uint8_t I2C_SCL_PIN = 22;
+
+// ===========================================================================
+//  Types used in function signatures — must be declared before the first
+//  function so Arduino's auto-generated prototypes (inserted just above the
+//  first function) can see them.
+// ===========================================================================
+static const int SYSEX_MAX = 256;
+
+// Firmata input-parser state. Two independent instances exist: one for the live
+// host connection and one for replaying scheduler tasks — so a half-received
+// live message can never be corrupted by task playback (and vice-versa).
+struct ParserState {
+  bool    parsingSysex = false;
+  int     waitForData = 0;
+  uint8_t executeMultiByteCommand = 0;
+  uint8_t multiByteChannel = 0;
+  uint8_t storedInputData[2] = { 0, 0 };
+  uint8_t sysexBuffer[SYSEX_MAX];
+  int     sysexBytesRead = 0;
+};
+
+// Scheduler task storage.
+static const uint8_t  MAX_TASKS      = 8;
+static const uint16_t MAX_TASK_BYTES = 512;
+
+struct SchedTask {
+  bool     used = false;
+  uint8_t  id = 0;
+  uint32_t time_ms = 0;   // absolute millis() when due; 0 = not scheduled
+  uint16_t len = 0;       // bytes of task data stored
+  uint16_t pos = 0;       // execution cursor
+  uint8_t  data[MAX_TASK_BYTES];
+};
 
 // Full digital pins: support INPUT / INPUT_PULLUP / OUTPUT / PWM.
 static bool isFullDigital(uint8_t pin) {
@@ -168,6 +227,7 @@ static int pinOfAnalogChannel(uint8_t ch) {
 // ===========================================================================
 static uint8_t  pinModes[TOTAL_PINS];   // current Firmata mode per pin
 static int      pinValues[TOTAL_PINS];  // last written output / PWM value
+static bool     pinConfigured[TOTAL_PINS]; // host explicitly set a digital mode
 static uint16_t analogReportMask = 0;   // bit c = report analog channel c
 static bool     reportPort[NUM_PORTS];  // digital input reporting per port
 static uint8_t  previousPort[NUM_PORTS];// last reported digital port mask
@@ -183,20 +243,24 @@ static const uint8_t MAX_CONT_READS = 8;
 static ContinuousRead contReads[MAX_CONT_READS];
 
 // ===========================================================================
-//  Input parser state (host -> device)
+//  Parser + scheduler instances (types declared above the first function)
 // ===========================================================================
-static bool    parsingSysex = false;
-static int     waitForData = 0;
-static uint8_t executeMultiByteCommand = 0;
-static uint8_t multiByteChannel = 0;
-static uint8_t storedInputData[2];
+static ParserState liveParser;
+static ParserState taskParser;
 
-static const int SYSEX_MAX = 256;
-static uint8_t   sysexBuffer[SYSEX_MAX];
-static int       sysexBytesRead = 0;
+static SchedTask  schedTasks[MAX_TASKS];
+static SchedTask *runningTask = nullptr;
 
 // Scratch buffer used to build outgoing frames.
-static uint8_t   frameBuf[600];
+static uint8_t   frameBuf[1024];
+
+// ===========================================================================
+//  Dual-transport master arbitration (latest-wins)
+// ===========================================================================
+// Exactly one transport "owns" the board at a time. A new connection on either
+// transport calls claimMaster(), which evicts the other transport's holder.
+enum ActiveTransport : uint8_t { TR_NONE = 0, TR_TCP, TR_BLE };
+static ActiveTransport activeTransport = TR_NONE;
 
 // ===========================================================================
 //  Forward declarations
@@ -206,10 +270,26 @@ static void transportPoll();
 static void sendFrame(const uint8_t *buf, size_t len);
 static bool transportConnected();
 static void onNewConnection();
+static void claimMaster(ActiveTransport who);
+#if ENABLE_WIFI
+static void tcpDrop();
+static void tcpSend(const uint8_t *buf, size_t len);
+#endif
+#if ENABLE_BLE
+static void bleDrop();
+static void bleSend(const uint8_t *buf, size_t len);
+#endif
 
-static void processByte(uint8_t b);
+static void processByte(ParserState &ps, uint8_t b);
 static void processSysex(const uint8_t *buf, int len);
 static void systemResetState();
+static void schedHandleSysex(const uint8_t *payload, int plen);
+static void schedTick();
+static void schedReset();
+// Explicit prototypes for the functions whose signatures use SchedTask, so
+// the Arduino auto-prototype generator doesn't emit them above the struct.
+static SchedTask *schedFind(uint8_t id);
+static bool       schedExecute(SchedTask *t);
 
 // ===========================================================================
 //  PWM helper (works on both core 2.x and 3.x)
@@ -354,13 +434,13 @@ static void handleSetPinMode(uint8_t pin, uint8_t mode) {
   if (pin >= TOTAL_PINS) return;
   switch (mode) {
     case PIN_MODE_INPUT:
-      if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; }
+      if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
       break;
     case PIN_MODE_PULLUP:
-      if (isFullDigital(pin)) { pinMode(pin, INPUT_PULLUP); pinModes[pin] = mode; pinValues[pin] = 1; }
+      if (isFullDigital(pin)) { pinMode(pin, INPUT_PULLUP); pinModes[pin] = mode; pinValues[pin] = 1; pinConfigured[pin] = true; }
       break;
     case PIN_MODE_OUTPUT:
-      if (isFullDigital(pin)) { pinMode(pin, OUTPUT); pinModes[pin] = mode; }
+      if (isFullDigital(pin)) { pinMode(pin, OUTPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
       break;
     case PIN_MODE_ANALOG:
       if (analogChannelOfPin(pin) >= 0) { pinModes[pin] = mode; }
@@ -423,7 +503,7 @@ static void handleReportDigital(uint8_t port, uint8_t enable) {
     for (int i = 0; i < 8; i++) {
       uint8_t pin = port * 8 + i;
       if (pin >= TOTAL_PINS) break;
-      if (!isUsable(pin)) continue;
+      if (!isUsable(pin) || !pinConfigured[pin]) continue;  // skip floating, unconfigured pins
       uint8_t m = pinModes[pin];
       if (m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP) {
         if (digitalRead(pin)) mask |= (1 << i);
@@ -573,6 +653,7 @@ static void processSysex(const uint8_t *buf, int len) {
     case STRING_DATA:           handleString(data, dlen);    break;
     case I2C_CONFIG:            handleI2CConfig(data, dlen);  break;
     case I2C_REQUEST:           handleI2CRequest(data, dlen); break;
+    case SCHEDULER_DATA:        schedHandleSysex(data, dlen); break;
     default:                    break;  // unknown SysEx ignored
   }
 }
@@ -580,42 +661,42 @@ static void processSysex(const uint8_t *buf, int len) {
 // ===========================================================================
 //  Input byte processor (Firmata state machine)
 // ===========================================================================
-static void processByte(uint8_t inputData) {
-  if (parsingSysex) {
+static void processByte(ParserState &ps, uint8_t inputData) {
+  if (ps.parsingSysex) {
     if (inputData == END_SYSEX) {
-      parsingSysex = false;
-      processSysex(sysexBuffer, sysexBytesRead);
-    } else if (sysexBytesRead < SYSEX_MAX) {
-      sysexBuffer[sysexBytesRead++] = inputData;
+      ps.parsingSysex = false;
+      processSysex(ps.sysexBuffer, ps.sysexBytesRead);
+    } else if (ps.sysexBytesRead < SYSEX_MAX) {
+      ps.sysexBuffer[ps.sysexBytesRead++] = inputData;
     }
     return;
   }
 
-  if (waitForData > 0 && inputData < 0x80) {
-    waitForData--;
-    storedInputData[waitForData] = inputData;   // [1]=first byte, [0]=second byte
-    if (waitForData == 0 && executeMultiByteCommand != 0) {
-      switch (executeMultiByteCommand) {
+  if (ps.waitForData > 0 && inputData < 0x80) {
+    ps.waitForData--;
+    ps.storedInputData[ps.waitForData] = inputData;   // [1]=first byte, [0]=second byte
+    if (ps.waitForData == 0 && ps.executeMultiByteCommand != 0) {
+      switch (ps.executeMultiByteCommand) {
         case ANALOG_MESSAGE:
-          handleAnalogMessage(multiByteChannel, storedInputData[1], storedInputData[0]);
+          handleAnalogMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
           break;
         case DIGITAL_MESSAGE:
-          handleDigitalMessage(multiByteChannel, storedInputData[1], storedInputData[0]);
+          handleDigitalMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
           break;
         case SET_PIN_MODE:
-          handleSetPinMode(storedInputData[1], storedInputData[0]);
+          handleSetPinMode(ps.storedInputData[1], ps.storedInputData[0]);
           break;
         case SET_DIGITAL_PIN_VALUE:
-          handleSetDigitalPinValue(storedInputData[1], storedInputData[0]);
+          handleSetDigitalPinValue(ps.storedInputData[1], ps.storedInputData[0]);
           break;
         case REPORT_ANALOG:
-          handleReportAnalog(multiByteChannel, storedInputData[0]);
+          handleReportAnalog(ps.multiByteChannel, ps.storedInputData[0]);
           break;
         case REPORT_DIGITAL:
-          handleReportDigital(multiByteChannel, storedInputData[0]);
+          handleReportDigital(ps.multiByteChannel, ps.storedInputData[0]);
           break;
       }
-      executeMultiByteCommand = 0;
+      ps.executeMultiByteCommand = 0;
     }
     return;
   }
@@ -623,8 +704,8 @@ static void processByte(uint8_t inputData) {
   // New command byte.
   uint8_t command;
   if (inputData < 0xF0) {
-    command          = inputData & 0xF0;
-    multiByteChannel = inputData & 0x0F;
+    command             = inputData & 0xF0;
+    ps.multiByteChannel = inputData & 0x0F;
   } else {
     command = inputData;
   }
@@ -634,18 +715,200 @@ static void processByte(uint8_t inputData) {
     case DIGITAL_MESSAGE:
     case SET_PIN_MODE:
     case SET_DIGITAL_PIN_VALUE:
-      waitForData = 2; executeMultiByteCommand = command; break;
+      ps.waitForData = 2; ps.executeMultiByteCommand = command; break;
     case REPORT_ANALOG:
     case REPORT_DIGITAL:
-      waitForData = 1; executeMultiByteCommand = command; break;
+      ps.waitForData = 1; ps.executeMultiByteCommand = command; break;
     case START_SYSEX:
-      parsingSysex = true; sysexBytesRead = 0; break;
+      ps.parsingSysex = true; ps.sysexBytesRead = 0; break;
     case SYSTEM_RESET:
       systemResetState(); break;
     case REPORT_VERSION:
       sendProtocolVersion(); break;
     default:
       break;  // ignore unknown command bytes
+  }
+}
+
+// ===========================================================================
+//  Firmata Scheduler  (SysEx 0x7B)
+//  Store tasks (recorded Firmata messages + delays) and replay them
+//  autonomously — even after the client disconnects. Wire format follows the
+//  official Firmata Scheduler protocol: Encoder7Bit packing for task data and
+//  32-bit times, and "a trailing DELAY_TASK loops the task".
+//  (SchedTask storage is declared earlier, near ParserState.)
+// ===========================================================================
+static SchedTask *schedFind(uint8_t id) {
+  for (uint8_t i = 0; i < MAX_TASKS; i++)
+    if (schedTasks[i].used && schedTasks[i].id == id) return &schedTasks[i];
+  return nullptr;
+}
+
+// Encoder7Bit decode: unpack `outBytes` 8-bit bytes from 7-bit `in`.
+static void sched7BitDecode(int outBytes, const uint8_t *in, uint8_t *out) {
+  for (int i = 0; i < outBytes; i++) {
+    int j = i << 3;
+    int pos = j / 7;
+    uint8_t shift = j % 7;
+    out[i] = (in[pos] >> shift) | ((in[pos + 1] << (7 - shift)) & 0xFF);
+  }
+}
+static inline int sched7BitOutBytes(int encodedLen) { return (encodedLen * 7) >> 3; }
+
+// Decode a 32-bit little-endian value from 5 Encoder7Bit-packed bytes.
+static uint32_t sched7BitTime(const uint8_t *enc5) {
+  uint8_t b[4];
+  sched7BitDecode(4, enc5, b);
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static void schedReset() {
+  for (uint8_t i = 0; i < MAX_TASKS; i++) schedTasks[i].used = false;
+  runningTask = nullptr;
+}
+
+static void schedSendError(uint8_t id) {
+  uint8_t b[5] = { START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX };
+  sendFrame(b, 5);
+}
+
+static void schedCreate(uint8_t id, uint16_t len) {
+  if (schedFind(id) || len > MAX_TASK_BYTES) { schedSendError(id); return; }
+  for (uint8_t i = 0; i < MAX_TASKS; i++) {
+    if (!schedTasks[i].used) {
+      schedTasks[i].used = true; schedTasks[i].id = id;
+      schedTasks[i].time_ms = 0; schedTasks[i].len = len; schedTasks[i].pos = 0;
+      return;
+    }
+  }
+  schedSendError(id);  // no free slot
+}
+
+static void schedDelete(uint8_t id) {
+  SchedTask *t = schedFind(id);
+  if (t) { if (runningTask == t) runningTask = nullptr; t->used = false; }
+}
+
+static void schedAdd(uint8_t id, const uint8_t *data, int n) {
+  SchedTask *t = schedFind(id);
+  if (!t) { schedSendError(id); return; }
+  if ((int)t->pos + n > (int)t->len) return;  // would overflow reserved length
+  for (int i = 0; i < n; i++) t->data[t->pos++] = data[i];
+}
+
+static void schedSchedule(uint8_t id, uint32_t delayMs) {
+  SchedTask *t = schedFind(id);
+  if (!t) { schedSendError(id); return; }
+  t->pos = 0;
+  t->time_ms = millis() + delayMs;
+  if (t->time_ms == 0) t->time_ms = 1;        // reserve 0 for "not scheduled"
+}
+
+// A DELAY_TASK encountered while a task is executing.
+static void schedDelayRunning(uint32_t delayMs) {
+  if (!runningTask) return;
+  uint32_t now = millis();
+  runningTask->time_ms += delayMs;
+  if ((int32_t)(runningTask->time_ms - now) < 0) runningTask->time_ms = now;
+  if (runningTask->time_ms == 0) runningTask->time_ms = 1;
+}
+
+static void schedQueryAll() {
+  int n = 0;
+  frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_ALL_REPLY;
+  for (uint8_t i = 0; i < MAX_TASKS; i++)
+    if (schedTasks[i].used) frameBuf[n++] = schedTasks[i].id;
+  frameBuf[n++] = END_SYSEX;
+  sendFrame(frameBuf, n);
+}
+
+// Encoder7Bit encode one byte into frameBuf, carrying state in shift/prev.
+static void sched7BitPut(int &n, uint8_t &shift, uint8_t &prev, uint8_t d) {
+  if (shift == 0) { frameBuf[n++] = d & 0x7F; shift = 1; prev = d >> 7; }
+  else {
+    frameBuf[n++] = (uint8_t)((((uint16_t)d << shift) & 0x7F) | prev);
+    if (shift == 6) { frameBuf[n++] = d >> 1; shift = 0; }
+    else { shift++; prev = d >> (8 - shift); }
+  }
+}
+
+static void schedQueryTask(uint8_t id) {
+  SchedTask *t = schedFind(id);
+  if (!t) { schedSendError(id); return; }
+  int n = 0;
+  frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_REPLY;
+  frameBuf[n++] = id;
+  // payload = time_ms(4 LE) + len(2 LE) + pos(2 LE) + data[len], Encoder7Bit-packed
+  uint8_t header[8] = {
+    (uint8_t)(t->time_ms), (uint8_t)(t->time_ms >> 8),
+    (uint8_t)(t->time_ms >> 16), (uint8_t)(t->time_ms >> 24),
+    (uint8_t)(t->len), (uint8_t)(t->len >> 8),
+    (uint8_t)(t->pos), (uint8_t)(t->pos >> 8)
+  };
+  uint8_t shift = 0, prev = 0;
+  for (int i = 0; i < 8; i++)             sched7BitPut(n, shift, prev, header[i]);
+  for (uint16_t i = 0; i < t->len; i++)   sched7BitPut(n, shift, prev, t->data[i]);
+  if (shift > 0) frameBuf[n++] = prev;
+  frameBuf[n++] = END_SYSEX;
+  sendFrame(frameBuf, n);
+}
+
+static void schedHandleSysex(const uint8_t *payload, int plen) {
+  if (plen < 1) return;
+  switch (payload[0]) {
+    case SCHED_CREATE:
+      if (plen == 4) schedCreate(payload[1], (uint16_t)(payload[2] | (payload[3] << 7)));
+      break;
+    case SCHED_DELETE:
+      if (plen == 2) schedDelete(payload[1]);
+      break;
+    case SCHED_ADD:
+      if (plen > 2) {
+        int outLen = sched7BitOutBytes(plen - 2);
+        static uint8_t dec[MAX_TASK_BYTES];
+        if (outLen > (int)sizeof(dec)) outLen = sizeof(dec);
+        sched7BitDecode(outLen, payload + 2, dec);
+        schedAdd(payload[1], dec, outLen);
+      }
+      break;
+    case SCHED_DELAY:
+      if (plen == 6) schedDelayRunning(sched7BitTime(payload + 1));
+      break;
+    case SCHED_SCHEDULE:
+      if (plen == 7) schedSchedule(payload[1], sched7BitTime(payload + 2));
+      break;
+    case SCHED_QUERY_ALL: schedQueryAll(); break;
+    case SCHED_QUERY:     if (plen == 2) schedQueryTask(payload[1]); break;
+    case SCHED_RESET:     schedReset(); break;
+    default: break;
+  }
+}
+
+// Replay a task's bytes through the task parser until a delay reschedules it or
+// it finishes. Returns true if the task should be kept (rescheduled / looping).
+static bool schedExecute(SchedTask *t) {
+  uint32_t start = t->time_ms;
+  runningTask = t;
+  taskParser = ParserState();                 // each run resumes at a message boundary
+  while (t->pos < t->len) {
+    processByte(taskParser, t->data[t->pos++]);
+    if (t->time_ms != start) {                // a DELAY_TASK fired
+      if (t->pos >= t->len) t->pos = 0;       // trailing delay -> loop from the start
+      runningTask = nullptr;
+      return true;
+    }
+  }
+  runningTask = nullptr;
+  return false;                               // ran to the end with no trailing delay -> one-shot
+}
+
+static void schedTick() {
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < MAX_TASKS; i++) {
+    SchedTask *t = &schedTasks[i];
+    if (t->used && t->time_ms != 0 && (int32_t)(now - t->time_ms) >= 0) {
+      if (!schedExecute(t)) t->used = false;  // one-shot finished -> free the slot
+    }
   }
 }
 
@@ -659,7 +922,7 @@ static void checkDigitalInputs() {
     for (int i = 0; i < 8; i++) {
       uint8_t pin = port * 8 + i;
       if (pin >= TOTAL_PINS) break;
-      if (!isUsable(pin)) continue;
+      if (!isUsable(pin) || !pinConfigured[pin]) continue;  // skip floating, unconfigured pins
       uint8_t m = pinModes[pin];
       if (m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP) {
         if (digitalRead(pin)) mask |= (1 << i);
@@ -690,115 +953,155 @@ static void sampleAnalogAndI2C() {
 // ===========================================================================
 //  Reset
 // ===========================================================================
-static void systemResetState() {
-  parsingSysex = false;
-  waitForData = 0;
-  executeMultiByteCommand = 0;
-  sysexBytesRead = 0;
+// Light reset for a fresh connection: clears the live parser and reporting
+// state but PRESERVES pin modes/values and any running scheduler tasks, so a
+// queued task keeps running across client disconnect/reconnect.
+static void resetSessionState() {
+  liveParser = ParserState();
   analogReportMask = 0;
   for (uint8_t i = 0; i < NUM_PORTS; i++) { reportPort[i] = false; previousPort[i] = 0; }
   for (uint8_t i = 0; i < MAX_CONT_READS; i++) contReads[i].active = false;
+}
+
+// Full reset (Firmata SYSTEM_RESET 0xFF, and at boot): also resets every pin
+// and deletes all scheduler tasks.
+static void systemResetState() {
+  resetSessionState();
+  taskParser = ParserState();
+  schedReset();
   for (uint8_t pin = 0; pin < TOTAL_PINS; pin++) {
     if (isUsable(pin)) pinMode(pin, INPUT);
-    pinModes[pin]  = PIN_MODE_INPUT;
-    pinValues[pin] = 0;
+    pinModes[pin]      = PIN_MODE_INPUT;
+    pinValues[pin]     = 0;
+    pinConfigured[pin] = false;
   }
   samplingInterval = 19;
 }
 
-// Called when a fresh client/central attaches.
+// Called when a fresh client/central attaches. Does NOT wipe pins or tasks.
 static void onNewConnection() {
-  systemResetState();
+  resetSessionState();
   sendProtocolVersion();
+}
+
+// Build the standard STRING_DATA "eviction notice" the board sends to a client
+// right before handing the board to a newcomer (latest-wins). The sentinel
+// (0x01 + "EVICTED") is recognised by SwiftFirmataClient. Returns the length.
+static int buildEvictionFrame(uint8_t *out) {
+  static const char *s = "\x01" "EVICTED";
+  int n = 0;
+  out[n++] = START_SYSEX;
+  out[n++] = STRING_DATA;
+  for (const char *p = s; *p; ++p) {
+    out[n++] = (uint8_t)(*p) & 0x7F;
+    out[n++] = ((uint8_t)(*p) >> 7) & 0x7F;
+  }
+  out[n++] = END_SYSEX;
+  return n;
 }
 
 // ===========================================================================
 //                            TRANSPORT — Wi-Fi / Bonjour
 // ===========================================================================
-#if !USE_BLE
+#if ENABLE_WIFI
 
 static WiFiServer tcpServer(FIRMATA_TCP_PORT);
 static WiFiClient tcpClient;
-
-static void wifiConnect() {
-  Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setHostname(MDNS_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint8_t tries = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
-    Serial.print('.');
-    if (++tries > 75) {           // ~30 s, then reboot and retry
-      Serial.println("\nWi-Fi connect failed, restarting...");
-      ESP.restart();
-    }
-  }
-  Serial.print("\nConnected. IP = ");
-  Serial.println(WiFi.localIP());
-}
+static bool       wifiReady = false;
 
 static void startBonjour() {
+  MDNS.end();
   if (!MDNS.begin(MDNS_HOSTNAME)) {
     Serial.println("mDNS start failed");
     return;
   }
   MDNS.addService("firmata", "tcp", FIRMATA_TCP_PORT);   // -> _firmata._tcp
-  static String ipStr   = WiFi.localIP().toString();
-  static String portStr = String(FIRMATA_TCP_PORT);
-  MDNS.addServiceTxt("firmata", "tcp", "ip",   ipStr.c_str());
-  MDNS.addServiceTxt("firmata", "tcp", "port", portStr.c_str());
+  String ip = WiFi.localIP().toString();
+  MDNS.addServiceTxt("firmata", "tcp", "ip",   ip.c_str());
+  MDNS.addServiceTxt("firmata", "tcp", "port", String(FIRMATA_TCP_PORT).c_str());
   Serial.printf("Bonjour: _firmata._tcp on %s:%d (instance \"%s\")\n",
-                ipStr.c_str(), FIRMATA_TCP_PORT, MDNS_HOSTNAME);
+                ip.c_str(), FIRMATA_TCP_PORT, MDNS_HOSTNAME);
 }
 
-static void transportInit() {
-  wifiConnect();
+static void startTcpServices() {
   startBonjour();
   tcpServer.begin();
   tcpServer.setNoDelay(true);
+  wifiReady = true;
+  Serial.print("Wi-Fi up. IP = ");
+  Serial.println(WiFi.localIP());
 }
 
-static void transportPoll() {
-  if (WiFi.status() != WL_CONNECTED) {       // recover from a dropped link
-    wifiConnect();
-    startBonjour();
+static void tcpInit() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
+  uint8_t tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {   // ~16 s, non-fatal
+    delay(400);
+    Serial.print('.');
+    tries++;
   }
-  // Accept a newly arriving client every poll. If one is already connected, the
-  // newcomer replaces it — so a reconnect succeeds even when the previous session
-  // wasn't closed cleanly (app force-quit, Mac sleep, half-open TCP, etc.).
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    startTcpServices();
+  } else {
+    Serial.println("Wi-Fi not up yet; continuing (BLE still available, will retry).");
+  }
+}
+
+// Drop the current TCP client (used when another transport takes the board).
+static void tcpDrop() {
+  if (tcpClient && tcpClient.connected()) {
+    tcpClient.stop();
+    Serial.println("Evicted TCP client (latest-wins)");
+  }
+}
+
+static void tcpSend(const uint8_t *buf, size_t len) {
+  if (tcpClient && tcpClient.connected()) tcpClient.write(buf, len);
+}
+
+static void tcpPoll() {
+  // Track Wi-Fi up/down without blocking (the stack auto-reconnects).
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiReady) { wifiReady = false; Serial.println("Wi-Fi lost"); }
+    return;
+  }
+  if (!wifiReady) startTcpServices();   // (re)connected — (re)start services
+
+  // Accept a newly arriving client. A new TCP connection always wins: it
+  // replaces any previous TCP client and (via claimMaster) evicts a BLE master.
   WiFiClient incoming = tcpServer.available();
   if (incoming) {
-    if (tcpClient && tcpClient.connected()) {
+    if (tcpClient && tcpClient.connected()) {                  // within-TCP replace
+      uint8_t nb[24];
+      tcpClient.write(nb, buildEvictionFrame(nb));             // courtesy notice
       tcpClient.stop();
-      Serial.println("Replacing previous TCP client");
     }
     tcpClient = incoming;
     tcpClient.setNoDelay(true);
     Serial.println("TCP client connected");
-    onNewConnection();
+    claimMaster(TR_TCP);
   }
-  // Drain whatever is available without blocking.
+  // Release mastership if our client went away.
+  if (activeTransport == TR_TCP && (!tcpClient || !tcpClient.connected())) {
+    activeTransport = TR_NONE;
+  }
   for (int guard = 0; tcpClient && tcpClient.available() && guard < 1024; guard++) {
-    processByte((uint8_t)tcpClient.read());
+    processByte(liveParser, (uint8_t)tcpClient.read());
   }
 }
 
-static void sendFrame(const uint8_t *buf, size_t len) {
-  if (tcpClient && tcpClient.connected()) tcpClient.write(buf, len);
-}
-
-static bool transportConnected() {
-  return tcpClient && tcpClient.connected();
-}
-
-#endif // !USE_BLE
+#endif // ENABLE_WIFI
 
 // ===========================================================================
 //                            TRANSPORT — BLE (Nordic UART Service)
 // ===========================================================================
-#if USE_BLE
+#if ENABLE_BLE
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // host -> device
@@ -806,7 +1109,9 @@ static bool transportConnected() {
 
 static BLEServer         *bleServer = nullptr;
 static BLECharacteristic *txChar    = nullptr;
-static volatile bool      bleConnected = false;
+static volatile bool      bleConnected = false;   // a central currently holds the link
+static volatile uint16_t  bleConnId   = 0;        // its connection id
+static volatile bool      bleNewConnect = false;  // edge flag: a central just connected
 static bool               bleWasConnected = false;
 static volatile uint16_t  negotiatedMTU = 23;
 
@@ -842,19 +1147,30 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 };
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *) override { bleConnected = true; }
-  void onDisconnect(BLEServer *s) override {
-    bleConnected = false;
-    negotiatedMTU = 23;
-    s->getAdvertising()->start();   // allow a new connection
+  // Use the conn-id overloads so we can do latest-wins across multiple centrals.
+  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
+    uint16_t newConn = param->connect.conn_id;
+    if (bleConnected && bleConnId != newConn) {
+      s->disconnect(bleConnId);     // a new central wins: drop the previous one
+    }
+    bleConnId     = newConn;
+    bleConnected  = true;
+    bleNewConnect = true;           // loop() will claim mastership
+    s->startAdvertising();          // keep advertising so the board stays reclaimable
   }
-  // Not marked 'override' so the sketch still compiles if a core lacks it.
-  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) {
+  void onDisconnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
+    if (param->disconnect.conn_id == bleConnId) {  // the *current* master left
+      bleConnected = false;
+      negotiatedMTU = 23;
+    }
+    s->startAdvertising();
+  }
+  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
     negotiatedMTU = param->mtu.mtu;
   }
 };
 
-static void transportInit() {
+static void bleInit() {
   BLEDevice::init(BLE_DEVICE_NAME);
   BLEDevice::setMTU(517);  // request a large MTU (host has final say)
 
@@ -892,21 +1208,31 @@ static void transportInit() {
   Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 }
 
-static void transportPoll() {
-  if (bleConnected && !bleWasConnected) {
+// Drop the current BLE central (used when another transport takes the board).
+static void bleDrop() {
+  if (bleConnected && bleServer) {
+    bleServer->disconnect(bleConnId);
+    Serial.println("Evicted BLE central (latest-wins)");
+  }
+}
+
+static void blePoll() {
+  if (bleNewConnect) {
+    bleNewConnect = false;
     bleWasConnected = true;
     Serial.println("BLE central connected");
-    onNewConnection();
+    claimMaster(TR_BLE);
   } else if (!bleConnected && bleWasConnected) {
     bleWasConnected = false;
+    if (activeTransport == TR_BLE) activeTransport = TR_NONE;
     Serial.println("BLE central disconnected");
   }
   int b;
   int guard = 0;
-  while ((b = rxDequeue()) >= 0 && guard++ < 4096) processByte((uint8_t)b);
+  while ((b = rxDequeue()) >= 0 && guard++ < 4096) processByte(liveParser, (uint8_t)b);
 }
 
-static void sendFrame(const uint8_t *buf, size_t len) {
+static void bleSend(const uint8_t *buf, size_t len) {
   if (!bleConnected || !txChar) return;
   size_t chunk = (negotiatedMTU > 23) ? (size_t)(negotiatedMTU - 3) : 20;
   size_t off = 0;
@@ -919,9 +1245,60 @@ static void sendFrame(const uint8_t *buf, size_t len) {
   }
 }
 
-static bool transportConnected() { return bleConnected; }
+#endif // ENABLE_BLE
 
-#endif // USE_BLE
+// ===========================================================================
+//                  TRANSPORT — unified front-end (master arbitration)
+// ===========================================================================
+
+// Make `who` the single board master, evicting the other transport's holder.
+static void claimMaster(ActiveTransport who) {
+  // Courtesy notice to the outgoing (cross-transport) master before we drop it.
+  // sendFrame() still routes to the *old* master here (activeTransport not yet
+  // updated). Best-effort; a small delay lets a BLE notify flush before disconnect.
+  if (activeTransport != TR_NONE && activeTransport != who) {
+    uint8_t nb[24];
+    sendFrame(nb, buildEvictionFrame(nb));
+    delay(15);
+  }
+#if ENABLE_WIFI
+  if (who != TR_TCP) tcpDrop();
+#endif
+#if ENABLE_BLE
+  if (who != TR_BLE) bleDrop();
+#endif
+  activeTransport = who;
+  onNewConnection();   // fresh session (keeps pins + scheduler tasks)
+}
+
+static void transportInit() {
+#if ENABLE_WIFI
+  tcpInit();
+#endif
+#if ENABLE_BLE
+  bleInit();
+#endif
+}
+
+static void transportPoll() {
+#if ENABLE_WIFI
+  tcpPoll();
+#endif
+#if ENABLE_BLE
+  blePoll();
+#endif
+}
+
+static void sendFrame(const uint8_t *buf, size_t len) {
+#if ENABLE_WIFI
+  if (activeTransport == TR_TCP) { tcpSend(buf, len); return; }
+#endif
+#if ENABLE_BLE
+  if (activeTransport == TR_BLE) { bleSend(buf, len); return; }
+#endif
+}
+
+static bool transportConnected() { return activeTransport != TR_NONE; }
 
 // ===========================================================================
 //  Arduino entry points
@@ -943,6 +1320,10 @@ void setup() {
 
 void loop() {
   transportPoll();
+
+  // Scheduler runs whether or not a client is connected — that is the whole
+  // point: queue a task, disconnect, and the board keeps executing it.
+  schedTick();
 
   if (transportConnected()) {
     checkDigitalInputs();
