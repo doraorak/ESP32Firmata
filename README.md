@@ -8,12 +8,18 @@ It is self-contained — it implements the Firmata protocol directly, so the onl
 dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,
 `Wire`). No Firmata library needs to be installed.
 
-One sketch, two transports, selected with a single `#define` at the top:
+One sketch runs **both transports at once** — Wi-Fi/TCP + Bonjour **and** BLE — so
+the app can connect either way with no reflashing. Each can be turned off with a
+`#define` at the top of the sketch:
 
-| `USE_BLE` | Transport | Matches client |
-|-----------|-----------|----------------|
-| `0` (default) | Wi-Fi / TCP + Bonjour (mDNS) | `BonjourTransport` |
-| `1` | BLE Nordic UART Service (NUS) | `BLETransport` |
+| `#define` (default) | Transport | Matches client |
+|---------------------|-----------|----------------|
+| `ENABLE_WIFI 1` | Wi-Fi / TCP + Bonjour (mDNS) | `BonjourTransport` |
+| `ENABLE_BLE  1` | BLE Nordic UART Service (NUS) | `BLETransport` |
+
+Only one client controls the board at a time. The policy is **latest-wins**: a new
+connection on either transport evicts the current holder (a single, standard
+Firmata master). Set one `#define` to `0` to force a single-transport build.
 
 ## What it implements
 
@@ -45,12 +51,13 @@ reported with no capability so the app won't offer them.
    (core 3.x recommended; 2.x also supported).
 2. Open `ESP32Firmata.ino`.
 3. Edit the **USER CONFIGURATION** block at the top:
-   * `USE_BLE` → `0` for Bonjour, `1` for BLE.
-   * For Bonjour: set `WIFI_SSID` and `WIFI_PASS`.
+   * Set `WIFI_SSID` and `WIFI_PASS` for your network (used by the Bonjour/Wi-Fi transport).
+   * Optionally set `ENABLE_WIFI` or `ENABLE_BLE` to `0` to drop a transport.
 4. **Tools** menu:
    * **Board**: *ESP32 Dev Module* (`esp32:esp32:esp32`).
-   * **Partition Scheme**: for the **BLE** build pick *Minimal SPIFFS (1.9MB APP)*
-     or *Huge APP*. The Bonjour build fits the default scheme.
+   * **Partition Scheme**: the dual build (Wi-Fi **+** BLE) is large — pick
+     *Minimal SPIFFS (1.9MB APP)* or *Huge APP*. (A Wi-Fi-only build fits the
+     default scheme.)
 5. Upload, then open Serial Monitor at **115200** to see the IP / advertising status.
 
 ## Connecting from the app
@@ -59,13 +66,13 @@ reported with no capability so the app won't offer them.
   advertises `_firmata._tcp` on port **3030** with TXT records `ip` and `port`
   so the client connects straight to the IP (skipping flaky mDNS A-record
   resolution). macOS will prompt once for **Local Network** permission.
-* **BLE** — flash with `USE_BLE 1`, pick *BLE* in the app, press *Connect*.
-  The device advertises the Nordic UART Service UUID (so the app's
-  service-filtered scan finds it) and the name `Firmata-ESP32`
-  (usable in the optional name filter).
+* **BLE** — pick *BLE* in the app, press *Connect*. The device advertises the
+  Nordic UART Service UUID (so the app's service-filtered scan finds it) and the
+  name `Firmata-ESP32` (usable in the optional name filter).
 
-> The transport is chosen at **compile time**. If you select *BLE* in the app,
-> flash the BLE build; if you select *Bonjour*, flash the Wi-Fi build.
+> Both transports run simultaneously, so there's **no reflashing to switch** —
+> just pick Bonjour or BLE in the app. Whichever you connect with becomes the
+> board's single master; connecting the other way evicts it (latest-wins).
 
 ## Protocol notes
 
@@ -79,6 +86,6 @@ reported with no capability so the app won't offer them.
 
 ## Verified
 
-* `arduino-cli compile --fqbn esp32:esp32:esp32` (Bonjour build) — OK, ~75% flash.
-* `arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs` (BLE build) — OK, ~58% flash.
-* `swift test` on `SwiftFirmataClient` — 44/44 passing after the I2C fix.
+* Dual build (Wi-Fi + BLE): `arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs` — OK, ~88% flash.
+* Single-transport builds also compile (Wi-Fi-only ~75% on the default partition; BLE-only ~58%).
+* Latest-wins eviction, the Scheduler, and digital/analog I/O verified live against the board.
