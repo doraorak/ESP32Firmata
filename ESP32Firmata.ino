@@ -131,6 +131,14 @@ static const uint8_t SCHED_ERROR_REPLY     = 0x08;
 static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
 static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
 
+// --- NON-STANDARD logic extension (this fork only; see NONSTANDARD.md) ------
+// On-device registers + if/else so a stored task can make decisions by itself.
+static const uint8_t SCHED_EXT_SET          = 0x10;  // R[d] = const
+static const uint8_t SCHED_EXT_READ_DIGITAL = 0x11;  // R[d] = digitalRead(pin)
+static const uint8_t SCHED_EXT_READ_ANALOG  = 0x12;  // R[d] = analogRead(channel)
+static const uint8_t SCHED_EXT_IF           = 0x13;  // if !(a op b) skip N bytes
+static const uint8_t SCHED_EXT_SKIP         = 0x14;  // unconditional skip N bytes
+
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
 static const uint8_t PIN_MODE_OUTPUT = 0x01;
@@ -250,6 +258,10 @@ static ParserState taskParser;
 
 static SchedTask  schedTasks[MAX_TASKS];
 static SchedTask *runningTask = nullptr;
+
+// Non-standard scheduler registers: 16 global Int32s shared across tasks.
+static const uint8_t NUM_SCHED_REGS = 16;
+static int32_t       schedReg[NUM_SCHED_REGS];
 
 // Scratch buffer used to build outgoing frames.
 static uint8_t   frameBuf[1024];
@@ -764,6 +776,7 @@ static uint32_t sched7BitTime(const uint8_t *enc5) {
 
 static void schedReset() {
   for (uint8_t i = 0; i < MAX_TASKS; i++) schedTasks[i].used = false;
+  for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) schedReg[i] = 0;
   runningTask = nullptr;
 }
 
@@ -853,6 +866,74 @@ static void schedQueryTask(uint8_t id) {
   sendFrame(frameBuf, n);
 }
 
+// ---- NON-STANDARD scheduler logic extension (see NONSTANDARD.md) ----------
+
+static bool schedCompare(uint8_t op, int32_t a, int32_t b) {
+  switch (op) {
+    case 0: return a == b;
+    case 1: return a != b;
+    case 2: return a <  b;
+    case 3: return a >  b;
+    case 4: return a <= b;
+    case 5: return a >= b;
+    default: return false;
+  }
+}
+
+// Read one IF operand starting at payload[i]; advances i. Type byte: 0=register
+// (1 byte index), 1=constant (5 Encoder7Bit bytes of an Int32).
+static int32_t schedReadOperand(const uint8_t *payload, int plen, int &i) {
+  if (i >= plen) return 0;
+  uint8_t type = payload[i++];
+  if (type == 0) {                                   // register
+    if (i >= plen) return 0;
+    return schedReg[payload[i++] & 0x0F];
+  } else {                                           // constant
+    if (i + 5 > plen) { i = plen; return 0; }
+    int32_t v = (int32_t)sched7BitTime(payload + i);
+    i += 5;
+    return v;
+  }
+}
+
+// Advance the running task's cursor by `skip` bytes (forward-only; clamped).
+static void schedSkip(uint16_t skip) {
+  if (!runningTask) return;
+  uint32_t p = (uint32_t)runningTask->pos + skip;
+  runningTask->pos = (p > runningTask->len) ? runningTask->len : (uint16_t)p;
+}
+
+static void schedHandleExt(const uint8_t *payload, int plen) {
+  switch (payload[0]) {
+    case SCHED_EXT_SET:               // 0x10 reg <const:5>
+      if (plen == 7) schedReg[payload[1] & 0x0F] = (int32_t)sched7BitTime(payload + 2);
+      break;
+    case SCHED_EXT_READ_DIGITAL:      // 0x11 reg pin
+      if (plen == 3) schedReg[payload[1] & 0x0F] = digitalRead(payload[2]) ? 1 : 0;
+      break;
+    case SCHED_EXT_READ_ANALOG: {     // 0x12 reg channel
+      if (plen == 3) {
+        int pin = pinOfAnalogChannel(payload[2]);
+        schedReg[payload[1] & 0x0F] = (pin >= 0) ? analogRead(pin) : 0;
+      }
+      break;
+    }
+    case SCHED_EXT_IF: {              // 0x13 op <operandA> <operandB> skipLo skipHi
+      int i = 1;
+      uint8_t op = payload[i++];
+      int32_t a = schedReadOperand(payload, plen, i);
+      int32_t b = schedReadOperand(payload, plen, i);
+      if (i + 2 > plen) break;
+      uint16_t skip = (uint16_t)(payload[i] | (payload[i + 1] << 7));
+      if (!schedCompare(op, a, b)) schedSkip(skip);   // condition false -> skip block
+      break;
+    }
+    case SCHED_EXT_SKIP:             // 0x14 skipLo skipHi  (unconditional; for else)
+      if (plen == 3) schedSkip((uint16_t)(payload[1] | (payload[2] << 7)));
+      break;
+  }
+}
+
 static void schedHandleSysex(const uint8_t *payload, int plen) {
   if (plen < 1) return;
   switch (payload[0]) {
@@ -876,6 +957,13 @@ static void schedHandleSysex(const uint8_t *payload, int plen) {
       break;
     case SCHED_SCHEDULE:
       if (plen == 7) schedSchedule(payload[1], sched7BitTime(payload + 2));
+      break;
+    case SCHED_EXT_SET:
+    case SCHED_EXT_READ_DIGITAL:
+    case SCHED_EXT_READ_ANALOG:
+    case SCHED_EXT_IF:
+    case SCHED_EXT_SKIP:
+      schedHandleExt(payload, plen);
       break;
     case SCHED_QUERY_ALL: schedQueryAll(); break;
     case SCHED_QUERY:     if (plen == 2) schedQueryTask(payload[1]); break;
