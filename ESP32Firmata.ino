@@ -13,10 +13,10 @@
  * master — fully standard-compliant, no extra wire bytes). Scheduler tasks are
  * global and survive eviction/disconnect.
  *
- * It is byte-for-byte compatible with the SwiftFirmataClient package and the
- * "swiftata" macOS app.  Tested wire formats (firmware report, capability,
- * analog-mapping, pin-state, digital/analog I/O, extended-analog, I2C) follow
- * the protocol exactly as parsed by FirmataParser.swift.
+ * It is byte-for-byte compatible with the SwiftFirmataClient package — the
+ * tested wire formats (firmware report, capability, analog-mapping, pin-state,
+ * digital/analog I/O, extended-analog, I2C) follow the protocol exactly as
+ * parsed by FirmataParser.swift.
  *
  * ── Bonjour side ──
  *   Advertises  _firmata._tcp  on port 3030 with TXT records:
@@ -52,13 +52,13 @@
 #define FIRMATA_TCP_PORT   3030              // must match BonjourTransport default
 
 // --- BLE settings (used when ENABLE_BLE == 1) -----------------------------
-#define BLE_DEVICE_NAME    "Firmata-ESP32"   // optional name filter in the app
+#define BLE_DEVICE_NAME    "Firmata-ESP32"   // optional BLE name filter for clients
 
 #if !ENABLE_WIFI && !ENABLE_BLE
 #error "Enable at least one transport (ENABLE_WIFI and/or ENABLE_BLE)."
 #endif
 
-// --- Firmware identity (shown in the app header) --------------------------
+// --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
 #define FIRMWARE_MINOR     8

@@ -9,7 +9,7 @@ dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,
 `Wire`). No Firmata library needs to be installed.
 
 One sketch runs **both transports at once** — Wi-Fi/TCP + Bonjour **and** BLE — so
-the app can connect either way with no reflashing. Each can be turned off with a
+a client can connect either way with no reflashing. Each can be turned off with a
 `#define` at the top of the sketch:
 
 | `#define` (default) | Transport | Matches client |
@@ -43,7 +43,7 @@ The pin map matches a typical ESP32 dev board:
 * **I2C**: SDA = 21, SCL = 22
 
 Flash-connected and non-bonded GPIOs (1, 3, 6–11, 20, 24, 28–31, 37, 38) are
-reported with no capability so the app won't offer them.
+reported with no capability so a client won't offer them.
 
 ## Setup
 
@@ -60,23 +60,23 @@ reported with no capability so the app won't offer them.
      default scheme.)
 5. Upload, then open Serial Monitor at **115200** to see the IP / advertising status.
 
-## Connecting from the app
+## Connecting
 
-* **Bonjour** — pick *Bonjour* in the app and press *Connect*. The board
-  advertises `_firmata._tcp` on port **3030** with TXT records `ip` and `port`
-  so the client connects straight to the IP (skipping flaky mDNS A-record
-  resolution). macOS will prompt once for **Local Network** permission.
-* **BLE** — pick *BLE* in the app, press *Connect*. The device advertises the
-  Nordic UART Service UUID (so the app's service-filtered scan finds it) and the
-  name `Firmata-ESP32` (usable in the optional name filter).
+* **Bonjour** — the board advertises `_firmata._tcp` on port **3030** with TXT
+  records `ip` and `port`, so a client connects straight to the IP (skipping
+  flaky mDNS A-record resolution). On macOS a client is prompted once for
+  **Local Network** permission.
+* **BLE** — the device advertises the Nordic UART Service UUID (so a client's
+  service-filtered scan finds it) and the name `Firmata-ESP32` (usable as an
+  optional name filter).
 
 > Both transports run simultaneously, so there's **no reflashing to switch** —
-> just pick Bonjour or BLE in the app. Whichever you connect with becomes the
+> connect over Bonjour or BLE. Whichever a client connects with becomes the
 > board's single master; connecting the other way evicts it (latest-wins).
 
 ## Protocol notes
 
-* Firmware reports name **`FirmataESP32`** v2.8, protocol v2.8 — shown in the app header.
+* Firmware reports name **`FirmataESP32`** v2.8, protocol v2.8 in the firmware-report message.
 * Verified against `SwiftFirmataClient`'s parser test vectors: firmware report,
   capability, analog-mapping, pin-state, digital/analog messages, extended
   analog and I2C reply all use the exact wire format the client expects.
