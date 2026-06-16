@@ -131,8 +131,11 @@ static const uint8_t SCHED_ERROR_REPLY     = 0x08;
 static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
 static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
 
-// --- NON-STANDARD logic extension (this fork only; see NONSTANDARD.md) ------
+// --- Logic extension (see NONSTANDARD.md) -----------------------------------
 // On-device registers + if/else so a stored task can make decisions by itself.
+// Carried under the standard Scheduler's reserved extension command (0x7F,
+// EXTENDED_SCHEDULER_COMMAND) so a base Firmata scheduler ignores it cleanly.
+static const uint8_t SCHED_EXT_COMMAND      = 0x7F;  // EXTENDED_SCHEDULER_COMMAND
 static const uint8_t SCHED_EXT_SET          = 0x10;  // R[d] = const
 static const uint8_t SCHED_EXT_READ_DIGITAL = 0x11;  // R[d] = digitalRead(pin)
 static const uint8_t SCHED_EXT_READ_ANALOG  = 0x12;  // R[d] = analogRead(channel)
@@ -958,12 +961,8 @@ static void schedHandleSysex(const uint8_t *payload, int plen) {
     case SCHED_SCHEDULE:
       if (plen == 7) schedSchedule(payload[1], sched7BitTime(payload + 2));
       break;
-    case SCHED_EXT_SET:
-    case SCHED_EXT_READ_DIGITAL:
-    case SCHED_EXT_READ_ANALOG:
-    case SCHED_EXT_IF:
-    case SCHED_EXT_SKIP:
-      schedHandleExt(payload, plen);
+    case SCHED_EXT_COMMAND:            // 0x7F: our logic ops live under the
+      if (plen >= 2) schedHandleExt(payload + 1, plen - 1);  // reserved extension cmd
       break;
     case SCHED_QUERY_ALL: schedQueryAll(); break;
     case SCHED_QUERY:     if (plen == 2) schedQueryTask(payload[1]); break;
