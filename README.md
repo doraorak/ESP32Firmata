@@ -69,7 +69,7 @@ reported with no capability so the app won't offer them.
 
 ## Protocol notes
 
-* Firmware reports name **`Swiftata`** v2.8, protocol v2.8 — shown in the app header.
+* Firmware reports name **`FirmataESP32`** v2.8, protocol v2.8 — shown in the app header.
 * Verified against `SwiftFirmataClient`'s parser test vectors: firmware report,
   capability, analog-mapping, pin-state, digital/analog messages, extended
   analog and I2C reply all use the exact wire format the client expects.

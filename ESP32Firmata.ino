@@ -1307,7 +1307,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("=== ESP32 Firmata (Swiftata) ===");
+  Serial.printf("=== ESP32 Firmata: %s ===\n", FIRMWARE_NAME);
 
   analogReadResolution(12);
 #if defined(ADC_11db)
