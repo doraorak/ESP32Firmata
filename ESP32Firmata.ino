@@ -306,29 +306,8 @@ static void schedReset();
 static SchedTask *schedFind(uint8_t id);
 static bool       schedExecute(SchedTask *t);
 
-// ===========================================================================
-//  PWM helper (works on both core 2.x and 3.x)
-// ===========================================================================
-static void pwmWrite(uint8_t pin, int value) {
-  if (value < 0)   value = 0;
-  if (value > 255) value = 255;
-#if FIRMATA_CORE3
-  static bool attached[TOTAL_PINS] = { false };
-  if (!attached[pin]) { ledcAttach(pin, 5000, 8); attached[pin] = true; }
-  ledcWrite(pin, value);
-#else
-  static int  chForPin[TOTAL_PINS];
-  static bool init = false;
-  static int  nextCh = 0;
-  if (!init) { for (int i = 0; i < TOTAL_PINS; i++) chForPin[i] = -1; init = true; }
-  if (chForPin[pin] < 0 && nextCh < 16) {
-    chForPin[pin] = nextCh++;
-    ledcSetup(chForPin[pin], 5000, 8);
-    ledcAttachPin(pin, chForPin[pin]);
-  }
-  if (chForPin[pin] >= 0) ledcWrite(chForPin[pin], value);
-#endif
-}
+// PWM uses the Arduino core's analogWrite() (ESP32 core 3.x: LEDC-backed,
+// 8-bit). Firmata duty is 0..255, so callers clamp before writing.
 
 // ===========================================================================
 //  Outgoing Firmata messages
@@ -461,7 +440,7 @@ static void handleSetPinMode(uint8_t pin, uint8_t mode) {
       if (analogChannelOfPin(pin) >= 0) { pinModes[pin] = mode; }
       break;
     case PIN_MODE_PWM:
-      if (isFullDigital(pin)) { pinModes[pin] = mode; pwmWrite(pin, 0); pinValues[pin] = 0; }
+      if (isFullDigital(pin)) { pinModes[pin] = mode; analogWrite(pin, 0); pinValues[pin] = 0; }
       break;
     case PIN_MODE_I2C:
       pinModes[pin] = mode;
@@ -498,7 +477,7 @@ static void handleAnalogMessage(uint8_t pin, uint8_t lsb, uint8_t msb) {
   if (pin >= TOTAL_PINS) return;
   int value = (lsb & 0x7F) | ((msb & 0x7F) << 7);
   if (pinModes[pin] == PIN_MODE_PWM) {
-    pwmWrite(pin, value);
+    analogWrite(pin, value > 255 ? 255 : value);
     pinValues[pin] = value;
   }
 }
@@ -538,7 +517,7 @@ static void handleExtendedAnalog(const uint8_t *data, int len) {
   int value = 0;
   for (int i = 1; i < len; i++) value |= (int)(data[i] & 0x7F) << (7 * (i - 1));
   if (pinModes[pin] == PIN_MODE_PWM) {
-    pwmWrite(pin, value);
+    analogWrite(pin, value > 255 ? 255 : value);
     pinValues[pin] = value;
   }
 }
