@@ -256,18 +256,10 @@ struct ContinuousRead { uint16_t address; int reg; uint16_t count; bool active; 
 static const uint8_t MAX_CONT_READS = 8;
 static ContinuousRead contReads[MAX_CONT_READS];
 
-// ===========================================================================
-//  Parser + scheduler instances (types declared above the first function)
-// ===========================================================================
-static ParserState liveParser;
-static ParserState taskParser;
-
-static SchedTask  schedTasks[MAX_TASKS];
-static SchedTask *runningTask = nullptr;
-
 // Non-standard scheduler registers: 16 global Int32s shared across tasks.
+// (The Scheduler and FirmataProtocol classes, and their instances, are defined
+//  further down — after the send helpers they depend on.)
 static const uint8_t NUM_SCHED_REGS = 16;
-static int32_t       schedReg[NUM_SCHED_REGS];
 
 // Scratch buffer used to build outgoing frames.
 static uint8_t   frameBuf[2048];                 // sized for HTTP response bodies
@@ -299,16 +291,12 @@ static void bleDrop();
 static void bleSend(const uint8_t *buf, size_t len);
 #endif
 
-static void processByte(ParserState &ps, uint8_t b);
-static void processSysex(const uint8_t *buf, int len);
 static void systemResetState();
-static void schedHandleSysex(const uint8_t *payload, int plen);
-static void schedTick();
-static void schedReset();
-// Explicit prototypes for the functions whose signatures use SchedTask, so
-// the Arduino auto-prototype generator doesn't emit them above the struct.
-static SchedTask *schedFind(uint8_t id);
-static bool       schedExecute(SchedTask *t);
+
+// The Firmata protocol handler and the Scheduler are classes (see below); they
+// reference each other, so forward-declare both here.
+class Scheduler;
+class FirmataProtocol;
 
 // PWM uses the Arduino core's analogWrite() (ESP32 core 3.x: LEDC-backed,
 // 8-bit). Firmata duty is 0..255, so callers clamp before writing.
@@ -428,112 +416,7 @@ static void sendI2CReply(uint16_t address, int reg, const uint8_t *data, int cou
 // ===========================================================================
 //  Pin I/O handlers
 // ===========================================================================
-static void handleSetPinMode(uint8_t pin, uint8_t mode) {
-  if (pin >= TOTAL_PINS) return;
-  switch (mode) {
-    case PIN_MODE_INPUT:
-      if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
-      break;
-    case PIN_MODE_PULLUP:
-      if (isFullDigital(pin)) { pinMode(pin, INPUT_PULLUP); pinModes[pin] = mode; pinValues[pin] = 1; pinConfigured[pin] = true; }
-      break;
-    case PIN_MODE_OUTPUT:
-      if (isFullDigital(pin)) { pinMode(pin, OUTPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
-      break;
-    case PIN_MODE_ANALOG:
-      if (analogChannelOfPin(pin) >= 0) { pinModes[pin] = mode; }
-      break;
-    case PIN_MODE_PWM:
-      if (isFullDigital(pin)) { pinModes[pin] = mode; analogWrite(pin, 0); pinValues[pin] = 0; }
-      break;
-    case PIN_MODE_I2C:
-      pinModes[pin] = mode;
-      break;
-    default:
-      break;
-  }
-}
-
-static void handleSetDigitalPinValue(uint8_t pin, uint8_t value) {
-  if (pin >= TOTAL_PINS) return;
-  if (pinModes[pin] == PIN_MODE_OUTPUT) {
-    digitalWrite(pin, value ? HIGH : LOW);
-    pinValues[pin] = value ? 1 : 0;
-  }
-}
-
-// Write a whole 8-pin port; only OUTPUT pins are affected.
-static void handleDigitalMessage(uint8_t port, uint8_t lsb, uint8_t msb) {
-  uint8_t portValue = (lsb & 0x7F) | ((msb & 0x01) << 7);
-  for (int i = 0; i < 8; i++) {
-    uint8_t pin = port * 8 + i;
-    if (pin >= TOTAL_PINS) break;
-    if (pinModes[pin] == PIN_MODE_OUTPUT) {
-      uint8_t bit = (portValue >> i) & 0x01;
-      digitalWrite(pin, bit ? HIGH : LOW);
-      pinValues[pin] = bit;
-    }
-  }
-}
-
-// ANALOG_MESSAGE (host -> device) is a PWM write; the channel nibble is the pin.
-static void handleAnalogMessage(uint8_t pin, uint8_t lsb, uint8_t msb) {
-  if (pin >= TOTAL_PINS) return;
-  int value = (lsb & 0x7F) | ((msb & 0x7F) << 7);
-  if (pinModes[pin] == PIN_MODE_PWM) {
-    analogWrite(pin, value > 255 ? 255 : value);
-    pinValues[pin] = value;
-  }
-}
-
-static void handleReportAnalog(uint8_t channel, uint8_t enable) {
-  if (channel > 15) return;
-  if (enable) analogReportMask |=  (1 << channel);
-  else        analogReportMask &= ~(1 << channel);
-}
-
-static void handleReportDigital(uint8_t port, uint8_t enable) {
-  if (port >= NUM_PORTS) return;
-  reportPort[port] = (enable != 0);
-  if (reportPort[port]) {
-    // Send current state immediately so the host has an initial value.
-    uint8_t mask = 0;
-    for (int i = 0; i < 8; i++) {
-      uint8_t pin = port * 8 + i;
-      if (pin >= TOTAL_PINS) break;
-      if (!isUsable(pin) || !pinConfigured[pin]) continue;  // skip floating, unconfigured pins
-      uint8_t m = pinModes[pin];
-      if (m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP) {
-        if (digitalRead(pin)) mask |= (1 << i);
-      } else if (m == PIN_MODE_OUTPUT) {
-        if (pinValues[pin]) mask |= (1 << i);
-      }
-    }
-    previousPort[port] = mask;
-    sendDigitalPort(port, mask);
-  }
-}
-
-static void handleExtendedAnalog(const uint8_t *data, int len) {
-  if (len < 1) return;
-  uint8_t pin = data[0];
-  if (pin >= TOTAL_PINS) return;
-  int value = 0;
-  for (int i = 1; i < len; i++) value |= (int)(data[i] & 0x7F) << (7 * (i - 1));
-  if (pinModes[pin] == PIN_MODE_PWM) {
-    analogWrite(pin, value > 255 ? 255 : value);
-    pinValues[pin] = value;
-  }
-}
-
-// ===========================================================================
-//  I2C
-// ===========================================================================
-static void handleI2CConfig(const uint8_t *data, int len) {
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (len >= 2) i2cReadDelayUs = (data[0] & 0x7F) | ((data[1] & 0x7F) << 7);
-}
-
+// I2C device helpers (global; shared by the live handler and periodic sampling).
 static void i2cDoRead(uint16_t address, int reg, uint16_t count) {
   if (reg >= 0) {
     Wire.beginTransmission(address);
@@ -568,69 +451,610 @@ static void stopContinuousRead(uint16_t address) {
     if (contReads[i].active && contReads[i].address == address) contReads[i].active = false;
 }
 
-static void handleI2CRequest(const uint8_t *data, int len) {
-  if (len < 2) return;
-  uint16_t address = data[0] & 0x7F;
-  uint8_t  control = data[1];
-  uint8_t  mode    = (control >> 3) & 0x03;
-  bool     tenbit  = control & 0x20;
-  if (tenbit) address |= (uint16_t)(control & 0x07) << 7;
+// ===========================================================================
+//  Live protocol handler
+//  Parses an incoming Firmata byte stream (its own ParserState) and applies
+//  each command. One instance drives the live transport; a second drives
+//  scheduler task replay. Both act on shared device state and route scheduler
+//  SysEx to the shared Scheduler.
+// ===========================================================================
+class FirmataProtocol {
+ public:
+  ParserState ps;
+  Scheduler*  sched = nullptr;        // wired once at startup (see setup)
 
-  const uint8_t *payload = data + 2;
-  int plen = len - 2;
-
-  switch (mode) {
-    case 0: {  // WRITE
-      Wire.beginTransmission(address);
-      for (int i = 0; i + 1 < plen; i += 2) {
-        uint8_t b = (payload[i] & 0x7F) | ((payload[i + 1] & 0x7F) << 7);
-        Wire.write(b);
-      }
-      bool restart = control & 0x40;
-      Wire.endTransmission(!restart);  // restart -> no STOP
-      break;
+  void handleSetPinMode(uint8_t pin, uint8_t mode) {
+    if (pin >= TOTAL_PINS) return;
+    switch (mode) {
+      case PIN_MODE_INPUT:
+        if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
+        break;
+      case PIN_MODE_PULLUP:
+        if (isFullDigital(pin)) { pinMode(pin, INPUT_PULLUP); pinModes[pin] = mode; pinValues[pin] = 1; pinConfigured[pin] = true; }
+        break;
+      case PIN_MODE_OUTPUT:
+        if (isFullDigital(pin)) { pinMode(pin, OUTPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
+        break;
+      case PIN_MODE_ANALOG:
+        if (analogChannelOfPin(pin) >= 0) { pinModes[pin] = mode; }
+        break;
+      case PIN_MODE_PWM:
+        if (isFullDigital(pin)) { pinModes[pin] = mode; analogWrite(pin, 0); pinValues[pin] = 0; }
+        break;
+      case PIN_MODE_I2C:
+        pinModes[pin] = mode;
+        break;
+      default:
+        break;
     }
-    case 1: {  // READ_ONCE
-      int reg = -1; uint16_t count = 0;
-      if (plen >= 4) {        // register + count both present
-        reg   = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
-        count = (payload[2] & 0x7F) | ((payload[3] & 0x7F) << 7);
-      } else if (plen >= 2) { // count only
-        count = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
-      }
-      i2cDoRead(address, reg, count);
-      break;
-    }
-    case 2: {  // READ_CONTINUOUS
-      int reg = -1; uint16_t count = 0;
-      if (plen >= 4) {
-        reg   = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
-        count = (payload[2] & 0x7F) | ((payload[3] & 0x7F) << 7);
-      } else if (plen >= 2) {
-        count = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
-      }
-      addContinuousRead(address, reg, count);
-      break;
-    }
-    case 3:    // STOP_READING
-      stopContinuousRead(address);
-      break;
   }
-}
+
+  void handleSetDigitalPinValue(uint8_t pin, uint8_t value) {
+    if (pin >= TOTAL_PINS) return;
+    if (pinModes[pin] == PIN_MODE_OUTPUT) {
+      digitalWrite(pin, value ? HIGH : LOW);
+      pinValues[pin] = value ? 1 : 0;
+    }
+  }
+
+  // Write a whole 8-pin port; only OUTPUT pins are affected.
+  void handleDigitalMessage(uint8_t port, uint8_t lsb, uint8_t msb) {
+    uint8_t portValue = (lsb & 0x7F) | ((msb & 0x01) << 7);
+    for (int i = 0; i < 8; i++) {
+      uint8_t pin = port * 8 + i;
+      if (pin >= TOTAL_PINS) break;
+      if (pinModes[pin] == PIN_MODE_OUTPUT) {
+        uint8_t bit = (portValue >> i) & 0x01;
+        digitalWrite(pin, bit ? HIGH : LOW);
+        pinValues[pin] = bit;
+      }
+    }
+  }
+
+  // ANALOG_MESSAGE (host -> device) is a PWM write; the channel nibble is the pin.
+  void handleAnalogMessage(uint8_t pin, uint8_t lsb, uint8_t msb) {
+    if (pin >= TOTAL_PINS) return;
+    int value = (lsb & 0x7F) | ((msb & 0x7F) << 7);
+    if (pinModes[pin] == PIN_MODE_PWM) {
+      analogWrite(pin, value > 255 ? 255 : value);
+      pinValues[pin] = value;
+    }
+  }
+
+  void handleReportAnalog(uint8_t channel, uint8_t enable) {
+    if (channel > 15) return;
+    if (enable) analogReportMask |=  (1 << channel);
+    else        analogReportMask &= ~(1 << channel);
+  }
+
+  void handleReportDigital(uint8_t port, uint8_t enable) {
+    if (port >= NUM_PORTS) return;
+    reportPort[port] = (enable != 0);
+    if (reportPort[port]) {
+      // Send current state immediately so the host has an initial value.
+      uint8_t mask = 0;
+      for (int i = 0; i < 8; i++) {
+        uint8_t pin = port * 8 + i;
+        if (pin >= TOTAL_PINS) break;
+        if (!isUsable(pin) || !pinConfigured[pin]) continue;  // skip floating, unconfigured pins
+        uint8_t m = pinModes[pin];
+        if (m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP) {
+          if (digitalRead(pin)) mask |= (1 << i);
+        } else if (m == PIN_MODE_OUTPUT) {
+          if (pinValues[pin]) mask |= (1 << i);
+        }
+      }
+      previousPort[port] = mask;
+      sendDigitalPort(port, mask);
+    }
+  }
+
+  void handleExtendedAnalog(const uint8_t *data, int len) {
+    if (len < 1) return;
+    uint8_t pin = data[0];
+    if (pin >= TOTAL_PINS) return;
+    int value = 0;
+    for (int i = 1; i < len; i++) value |= (int)(data[i] & 0x7F) << (7 * (i - 1));
+    if (pinModes[pin] == PIN_MODE_PWM) {
+      analogWrite(pin, value > 255 ? 255 : value);
+      pinValues[pin] = value;
+    }
+  }
+
+  void handleI2CConfig(const uint8_t *data, int len) {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    if (len >= 2) i2cReadDelayUs = (data[0] & 0x7F) | ((data[1] & 0x7F) << 7);
+  }
+
+  void handleI2CRequest(const uint8_t *data, int len) {
+    if (len < 2) return;
+    uint16_t address = data[0] & 0x7F;
+    uint8_t  control = data[1];
+    uint8_t  mode    = (control >> 3) & 0x03;
+    bool     tenbit  = control & 0x20;
+    if (tenbit) address |= (uint16_t)(control & 0x07) << 7;
+
+    const uint8_t *payload = data + 2;
+    int plen = len - 2;
+
+    switch (mode) {
+      case 0: {  // WRITE
+        Wire.beginTransmission(address);
+        for (int i = 0; i + 1 < plen; i += 2) {
+          uint8_t b = (payload[i] & 0x7F) | ((payload[i + 1] & 0x7F) << 7);
+          Wire.write(b);
+        }
+        bool restart = control & 0x40;
+        Wire.endTransmission(!restart);  // restart -> no STOP
+        break;
+      }
+      case 1: {  // READ_ONCE
+        int reg = -1; uint16_t count = 0;
+        if (plen >= 4) {        // register + count both present
+          reg   = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
+          count = (payload[2] & 0x7F) | ((payload[3] & 0x7F) << 7);
+        } else if (plen >= 2) { // count only
+          count = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
+        }
+        i2cDoRead(address, reg, count);
+        break;
+      }
+      case 2: {  // READ_CONTINUOUS
+        int reg = -1; uint16_t count = 0;
+        if (plen >= 4) {
+          reg   = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
+          count = (payload[2] & 0x7F) | ((payload[3] & 0x7F) << 7);
+        } else if (plen >= 2) {
+          count = (payload[0] & 0x7F) | ((payload[1] & 0x7F) << 7);
+        }
+        addContinuousRead(address, reg, count);
+        break;
+      }
+      case 3:    // STOP_READING
+        stopContinuousRead(address);
+        break;
+    }
+  }
+
+  void handleString(const uint8_t *data, int len) {
+    String s;
+    for (int i = 0; i + 1 < len; i += 2) {
+      uint16_t cp = (data[i] & 0x7F) | ((data[i + 1] & 0x7F) << 7);
+      if (cp < 128) s += (char)cp;
+    }
+    Serial.print("[host] "); Serial.println(s);
+  }
+
+  void processSysex(const uint8_t *buf, int len);   // defined after Scheduler
+
+  // Firmata input byte state machine; mutates this handler's own ParserState.
+  void process(uint8_t inputData) {
+    ParserState &ps = this->ps;
+    if (ps.parsingSysex) {
+      if (inputData == END_SYSEX) {
+        ps.parsingSysex = false;
+        processSysex(ps.sysexBuffer, ps.sysexBytesRead);
+      } else if (ps.sysexBytesRead < SYSEX_MAX) {
+        ps.sysexBuffer[ps.sysexBytesRead++] = inputData;
+      }
+      return;
+    }
+
+    if (ps.waitForData > 0 && inputData < 0x80) {
+      ps.waitForData--;
+      ps.storedInputData[ps.waitForData] = inputData;   // [1]=first byte, [0]=second byte
+      if (ps.waitForData == 0 && ps.executeMultiByteCommand != 0) {
+        switch (ps.executeMultiByteCommand) {
+          case ANALOG_MESSAGE:
+            handleAnalogMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
+            break;
+          case DIGITAL_MESSAGE:
+            handleDigitalMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
+            break;
+          case SET_PIN_MODE:
+            handleSetPinMode(ps.storedInputData[1], ps.storedInputData[0]);
+            break;
+          case SET_DIGITAL_PIN_VALUE:
+            handleSetDigitalPinValue(ps.storedInputData[1], ps.storedInputData[0]);
+            break;
+          case REPORT_ANALOG:
+            handleReportAnalog(ps.multiByteChannel, ps.storedInputData[0]);
+            break;
+          case REPORT_DIGITAL:
+            handleReportDigital(ps.multiByteChannel, ps.storedInputData[0]);
+            break;
+        }
+        ps.executeMultiByteCommand = 0;
+      }
+      return;
+    }
+
+    // New command byte.
+    uint8_t command;
+    if (inputData < 0xF0) {
+      command             = inputData & 0xF0;
+      ps.multiByteChannel = inputData & 0x0F;
+    } else {
+      command = inputData;
+    }
+
+    switch (command) {
+      case ANALOG_MESSAGE:
+      case DIGITAL_MESSAGE:
+      case SET_PIN_MODE:
+      case SET_DIGITAL_PIN_VALUE:
+        ps.waitForData = 2; ps.executeMultiByteCommand = command; break;
+      case REPORT_ANALOG:
+      case REPORT_DIGITAL:
+        ps.waitForData = 1; ps.executeMultiByteCommand = command; break;
+      case START_SYSEX:
+        ps.parsingSysex = true; ps.sysexBytesRead = 0; break;
+      case SYSTEM_RESET:
+        systemResetState(); break;
+      case REPORT_VERSION:
+        sendProtocolVersion(); break;
+      default:
+        break;  // ignore unknown command bytes
+    }
+  }
+};
 
 // ===========================================================================
-//  SysEx dispatch
+//  Firmata Scheduler (SysEx 0x7B) — class
+//
+//  Stores tasks (recorded Firmata messages + delays) and replays them — through
+//  a dedicated FirmataProtocol instance (`replay`) — even with no host
+//  connected. Also owns the non-standard logic extension: 16 Int32 registers,
+//  if/else, and internet actions. Encoder7Bit helpers live here as methods.
+//  Wire format follows the official Firmata Scheduler protocol.
 // ===========================================================================
-static void handleString(const uint8_t *data, int len) {
-  String s;
-  for (int i = 0; i + 1 < len; i += 2) {
-    uint16_t cp = (data[i] & 0x7F) | ((data[i + 1] & 0x7F) << 7);
-    if (cp < 128) s += (char)cp;
-  }
-  Serial.print("[host] "); Serial.println(s);
-}
+class Scheduler {
+ public:
+  SchedTask        tasks[MAX_TASKS];
+  SchedTask       *running = nullptr;
+  int32_t          regs[NUM_SCHED_REGS];
+  FirmataProtocol *replay = nullptr;     // wired once at startup (see setup)
+  String           httpRespBody;         // last HTTP response (until next request)
 
-static void processSysex(const uint8_t *buf, int len) {
+  SchedTask *find(uint8_t id) {
+    for (uint8_t i = 0; i < MAX_TASKS; i++)
+      if (tasks[i].used && tasks[i].id == id) return &tasks[i];
+    return nullptr;
+  }
+
+  // Encoder7Bit decode: unpack `outBytes` 8-bit bytes from 7-bit `in`.
+  void sched7BitDecode(int outBytes, const uint8_t *in, uint8_t *out) {
+    for (int i = 0; i < outBytes; i++) {
+      int j = i << 3;
+      int pos = j / 7;
+      uint8_t shift = j % 7;
+      out[i] = (in[pos] >> shift) | ((in[pos + 1] << (7 - shift)) & 0xFF);
+    }
+  }
+  int sched7BitOutBytes(int encodedLen) { return (encodedLen * 7) >> 3; }
+
+  // Decode a 32-bit little-endian value from 5 Encoder7Bit-packed bytes.
+  uint32_t sched7BitTime(const uint8_t *enc5) {
+    uint8_t b[4];
+    sched7BitDecode(4, enc5, b);
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+  }
+
+  // Encoder7Bit encode one byte into frameBuf, carrying state in shift/prev.
+  void sched7BitPut(int &n, uint8_t &shift, uint8_t &prev, uint8_t d) {
+    if (shift == 0) { frameBuf[n++] = d & 0x7F; shift = 1; prev = d >> 7; }
+    else {
+      frameBuf[n++] = (uint8_t)((((uint16_t)d << shift) & 0x7F) | prev);
+      if (shift == 6) { frameBuf[n++] = d >> 1; shift = 0; }
+      else { shift++; prev = d >> (8 - shift); }
+    }
+  }
+
+  // First (optionally signed) base-10 integer found in a buffer.
+  int32_t parseFirstInt(const uint8_t *buf, int n) {
+    int i = 0;
+    while (i < n && !(buf[i] >= '0' && buf[i] <= '9') && buf[i] != '-') i++;
+    if (i >= n) return 0;
+    bool neg = false;
+    if (buf[i] == '-') { neg = true; i++; }
+    int32_t v = 0; bool any = false;
+    while (i < n && buf[i] >= '0' && buf[i] <= '9') { v = v * 10 + (buf[i] - '0'); any = true; i++; }
+    if (!any) return 0;
+    return neg ? -v : v;
+  }
+
+  void reset() {
+    for (uint8_t i = 0; i < MAX_TASKS; i++) tasks[i].used = false;
+    for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) regs[i] = 0;
+    running = nullptr;
+  }
+
+  void sendError(uint8_t id) {
+    uint8_t b[5] = { START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX };
+    sendFrame(b, 5);
+  }
+
+  void create(uint8_t id, uint16_t len) {
+    if (find(id) || len > MAX_TASK_BYTES) { sendError(id); return; }
+    for (uint8_t i = 0; i < MAX_TASKS; i++) {
+      if (!tasks[i].used) {
+        tasks[i].used = true; tasks[i].id = id;
+        tasks[i].time_ms = 0; tasks[i].len = len; tasks[i].pos = 0;
+        return;
+      }
+    }
+    sendError(id);  // no free slot
+  }
+
+  void deleteTask(uint8_t id) {
+    SchedTask *t = find(id);
+    if (t) { if (running == t) running = nullptr; t->used = false; }
+  }
+
+  void add(uint8_t id, const uint8_t *data, int n) {
+    SchedTask *t = find(id);
+    if (!t) { sendError(id); return; }
+    if ((int)t->pos + n > (int)t->len) return;  // would overflow reserved length
+    for (int i = 0; i < n; i++) t->data[t->pos++] = data[i];
+  }
+
+  void schedule(uint8_t id, uint32_t delayMs) {
+    SchedTask *t = find(id);
+    if (!t) { sendError(id); return; }
+    t->pos = 0;
+    t->time_ms = millis() + delayMs;
+    if (t->time_ms == 0) t->time_ms = 1;        // reserve 0 for "not scheduled"
+  }
+
+  // A DELAY_TASK encountered while a task is executing.
+  void delayRunning(uint32_t delayMs) {
+    if (!running) return;
+    uint32_t now = millis();
+    running->time_ms += delayMs;
+    if ((int32_t)(running->time_ms - now) < 0) running->time_ms = now;
+    if (running->time_ms == 0) running->time_ms = 1;
+  }
+
+  void queryAll() {
+    int n = 0;
+    frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_ALL_REPLY;
+    for (uint8_t i = 0; i < MAX_TASKS; i++)
+      if (tasks[i].used) frameBuf[n++] = tasks[i].id;
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+  }
+
+  void queryTask(uint8_t id) {
+    SchedTask *t = find(id);
+    if (!t) { sendError(id); return; }
+    int n = 0;
+    frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_REPLY;
+    frameBuf[n++] = id;
+    // payload = time_ms(4 LE) + len(2 LE) + pos(2 LE) + data[len], Encoder7Bit-packed
+    uint8_t header[8] = {
+      (uint8_t)(t->time_ms), (uint8_t)(t->time_ms >> 8),
+      (uint8_t)(t->time_ms >> 16), (uint8_t)(t->time_ms >> 24),
+      (uint8_t)(t->len), (uint8_t)(t->len >> 8),
+      (uint8_t)(t->pos), (uint8_t)(t->pos >> 8)
+    };
+    uint8_t shift = 0, prev = 0;
+    for (int i = 0; i < 8; i++)             sched7BitPut(n, shift, prev, header[i]);
+    for (uint16_t i = 0; i < t->len; i++)   sched7BitPut(n, shift, prev, t->data[i]);
+    if (shift > 0) frameBuf[n++] = prev;
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+  }
+
+  // ---- NON-STANDARD logic extension (see NONSTANDARD.md) ----
+  bool compare(uint8_t op, int32_t a, int32_t b) {
+    switch (op) {
+      case 0: return a == b;
+      case 1: return a != b;
+      case 2: return a <  b;
+      case 3: return a >  b;
+      case 4: return a <= b;
+      case 5: return a >= b;
+      default: return false;
+    }
+  }
+
+  // Read one IF operand starting at payload[i]; advances i. Type byte: 0=register
+  // (1 byte index), 1=constant (5 Encoder7Bit bytes of an Int32).
+  int32_t readOperand(const uint8_t *payload, int plen, int &i) {
+    if (i >= plen) return 0;
+    uint8_t type = payload[i++];
+    if (type == 0) {                                   // register
+      if (i >= plen) return 0;
+      return regs[payload[i++] & 0x0F];
+    } else {                                           // constant
+      if (i + 5 > plen) { i = plen; return 0; }
+      int32_t v = (int32_t)sched7BitTime(payload + i);
+      i += 5;
+      return v;
+    }
+  }
+
+  // Advance the running task's cursor by `amount` bytes (forward-only; clamped).
+  void skip(uint16_t amount) {
+    if (!running) return;
+    uint32_t p = (uint32_t)running->pos + amount;
+    running->pos = (p > running->len) ? running->len : (uint16_t)p;
+  }
+
+  // Send the last HTTP result (status + body) to the connected host.
+  void sendHttpReply(int status) {
+    int n = 0;
+    frameBuf[n++] = START_SYSEX;
+    frameBuf[n++] = SCHEDULER_DATA;
+    frameBuf[n++] = SCHED_EXT_HTTP_REPLY;
+    frameBuf[n++] = status & 0x7F;
+    frameBuf[n++] = (status >> 7) & 0x7F;
+    int rlen = httpRespBody.length();
+    if (rlen > HTTP_REPLY_MAX) rlen = HTTP_REPLY_MAX;
+    const char *body = httpRespBody.c_str();
+    for (int k = 0; k < rlen; k++) {           // 14-bit LSB/MSB pairs (like STRING_DATA)
+      frameBuf[n++] = (uint8_t)body[k] & 0x7F;
+      frameBuf[n++] = ((uint8_t)body[k] >> 7) & 0x7F;
+    }
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+  }
+
+  // Internet action: a task (or live host) makes an HTTP request over Wi-Fi.
+  // ext payload: 0x15 method statusReg valueReg urlLo urlHi url[] bodyLo bodyHi body[].
+  // method 0=GET 1=POST. Stores HTTP status in R[statusReg] (0 = Wi-Fi down/error)
+  // and the first integer of the body in R[valueReg]; if a host is connected,
+  // status + body are returned as SCHED_EXT_HTTP_REPLY. HTTP only (see README).
+  void doHttp(const uint8_t *p, int plen) {
+    if (plen < 6) return;
+    uint8_t method   = p[1];
+    int     statusReg = p[2] & 0x0F;
+    int     valueReg  = p[3] & 0x0F;
+    int     urlLen    = p[4] | (p[5] << 7);
+    int i = 6;
+    if (urlLen <= 0 || i + urlLen > plen) return;
+    String url; url.reserve(urlLen + 1);
+    for (int k = 0; k < urlLen; k++) url += (char)p[i + k];
+    i += urlLen;
+    int bodyLen = 0;
+    if (i + 2 <= plen) { bodyLen = p[i] | (p[i + 1] << 7); i += 2; }
+    if (bodyLen < 0 || i + bodyLen > plen) bodyLen = 0;
+    String body; body.reserve(bodyLen + 1);
+    for (int k = 0; k < bodyLen; k++) body += (char)p[i + k];
+
+    httpRespBody = "";
+    int status = 0;
+#if ENABLE_WIFI
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.setConnectTimeout(8000);
+      http.setTimeout(8000);
+      http.setReuse(false);
+      WiFiClient client;                       // plain HTTP only (see README)
+      if (http.begin(client, url)) {
+        if (method == 1) {
+          http.addHeader("Content-Type", "application/json");
+          status = http.POST((uint8_t *)body.c_str(), body.length());
+        } else {
+          status = http.GET();
+        }
+        if (status > 0) httpRespBody = http.getString();
+        http.end();
+      }
+    }
+#endif
+    regs[statusReg] = status;
+
+    int rlen = httpRespBody.length();
+    if (rlen > 0) {
+      int m = rlen; if (m > HTTP_REPLY_MAX) m = HTTP_REPLY_MAX;
+      regs[valueReg] = parseFirstInt((const uint8_t *)httpRespBody.c_str(), m);
+    } else {
+      regs[valueReg] = 0;
+    }
+
+    if (transportConnected()) sendHttpReply(status);
+  }
+
+  void handleExt(const uint8_t *payload, int plen) {
+    switch (payload[0]) {
+      case SCHED_EXT_SET:               // 0x10 reg <const:5>
+        if (plen == 7) regs[payload[1] & 0x0F] = (int32_t)sched7BitTime(payload + 2);
+        break;
+      case SCHED_EXT_READ_DIGITAL:      // 0x11 reg pin
+        if (plen == 3) regs[payload[1] & 0x0F] = digitalRead(payload[2]) ? 1 : 0;
+        break;
+      case SCHED_EXT_READ_ANALOG: {     // 0x12 reg channel
+        if (plen == 3) {
+          int pin = pinOfAnalogChannel(payload[2]);
+          regs[payload[1] & 0x0F] = (pin >= 0) ? analogRead(pin) : 0;
+        }
+        break;
+      }
+      case SCHED_EXT_IF: {              // 0x13 op <operandA> <operandB> skipLo skipHi
+        int i = 1;
+        uint8_t op = payload[i++];
+        int32_t a = readOperand(payload, plen, i);
+        int32_t b = readOperand(payload, plen, i);
+        if (i + 2 > plen) break;
+        uint16_t amount = (uint16_t)(payload[i] | (payload[i + 1] << 7));
+        if (!compare(op, a, b)) skip(amount);   // condition false -> skip block
+        break;
+      }
+      case SCHED_EXT_SKIP:             // 0x14 skipLo skipHi  (unconditional; for else)
+        if (plen == 3) skip((uint16_t)(payload[1] | (payload[2] << 7)));
+        break;
+      case SCHED_EXT_HTTP:            // 0x15 internet request (see NONSTANDARD.md)
+        doHttp(payload, plen);
+        break;
+    }
+  }
+
+  void handleSysex(const uint8_t *payload, int plen) {
+    if (plen < 1) return;
+    switch (payload[0]) {
+      case SCHED_CREATE:
+        if (plen == 4) create(payload[1], (uint16_t)(payload[2] | (payload[3] << 7)));
+        break;
+      case SCHED_DELETE:
+        if (plen == 2) deleteTask(payload[1]);
+        break;
+      case SCHED_ADD:
+        if (plen > 2) {
+          int outLen = sched7BitOutBytes(plen - 2);
+          static uint8_t dec[MAX_TASK_BYTES];
+          if (outLen > (int)sizeof(dec)) outLen = sizeof(dec);
+          sched7BitDecode(outLen, payload + 2, dec);
+          add(payload[1], dec, outLen);
+        }
+        break;
+      case SCHED_DELAY:
+        if (plen == 6) delayRunning(sched7BitTime(payload + 1));
+        break;
+      case SCHED_SCHEDULE:
+        if (plen == 7) schedule(payload[1], sched7BitTime(payload + 2));
+        break;
+      case SCHED_EXT_COMMAND:            // 0x7F: our logic ops live under the
+        if (plen >= 2) handleExt(payload + 1, plen - 1);  // reserved extension cmd
+        break;
+      case SCHED_QUERY_ALL: queryAll(); break;
+      case SCHED_QUERY:     if (plen == 2) queryTask(payload[1]); break;
+      case SCHED_RESET:     reset(); break;
+      default: break;
+    }
+  }
+
+  // Replay a task's bytes through the replay handler until a delay reschedules it
+  // or it finishes. Returns true if the task should be kept (rescheduled/looping).
+  bool execute(SchedTask *t) {
+    uint32_t start = t->time_ms;
+    running = t;
+    replay->ps = ParserState();                 // each run resumes at a message boundary
+    while (t->pos < t->len) {
+      replay->process(t->data[t->pos++]);
+      if (t->time_ms != start) {                // a DELAY_TASK fired
+        if (t->pos >= t->len) t->pos = 0;       // trailing delay -> loop from the start
+        running = nullptr;
+        return true;
+      }
+    }
+    running = nullptr;
+    return false;                               // ran to end with no trailing delay -> one-shot
+  }
+
+  void tick() {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < MAX_TASKS; i++) {
+      SchedTask *t = &tasks[i];
+      if (t->used && t->time_ms != 0 && (int32_t)(now - t->time_ms) >= 0) {
+        if (!execute(t)) t->used = false;  // one-shot finished -> free the slot
+      }
+    }
+  }
+};
+
+// Now that Scheduler is complete, define the handler's scheduler-dispatching SysEx.
+void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
   if (len < 1) return;
   uint8_t cmd = buf[0];
   const uint8_t *data = buf + 1;
@@ -651,430 +1075,16 @@ static void processSysex(const uint8_t *buf, int len) {
     case STRING_DATA:           handleString(data, dlen);    break;
     case I2C_CONFIG:            handleI2CConfig(data, dlen);  break;
     case I2C_REQUEST:           handleI2CRequest(data, dlen); break;
-    case SCHEDULER_DATA:        schedHandleSysex(data, dlen); break;
+    case SCHEDULER_DATA:        sched->handleSysex(data, dlen); break;
     default:                    break;  // unknown SysEx ignored
   }
 }
 
-// ===========================================================================
-//  Input byte processor (Firmata state machine)
-// ===========================================================================
-static void processByte(ParserState &ps, uint8_t inputData) {
-  if (ps.parsingSysex) {
-    if (inputData == END_SYSEX) {
-      ps.parsingSysex = false;
-      processSysex(ps.sysexBuffer, ps.sysexBytesRead);
-    } else if (ps.sysexBytesRead < SYSEX_MAX) {
-      ps.sysexBuffer[ps.sysexBytesRead++] = inputData;
-    }
-    return;
-  }
-
-  if (ps.waitForData > 0 && inputData < 0x80) {
-    ps.waitForData--;
-    ps.storedInputData[ps.waitForData] = inputData;   // [1]=first byte, [0]=second byte
-    if (ps.waitForData == 0 && ps.executeMultiByteCommand != 0) {
-      switch (ps.executeMultiByteCommand) {
-        case ANALOG_MESSAGE:
-          handleAnalogMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
-          break;
-        case DIGITAL_MESSAGE:
-          handleDigitalMessage(ps.multiByteChannel, ps.storedInputData[1], ps.storedInputData[0]);
-          break;
-        case SET_PIN_MODE:
-          handleSetPinMode(ps.storedInputData[1], ps.storedInputData[0]);
-          break;
-        case SET_DIGITAL_PIN_VALUE:
-          handleSetDigitalPinValue(ps.storedInputData[1], ps.storedInputData[0]);
-          break;
-        case REPORT_ANALOG:
-          handleReportAnalog(ps.multiByteChannel, ps.storedInputData[0]);
-          break;
-        case REPORT_DIGITAL:
-          handleReportDigital(ps.multiByteChannel, ps.storedInputData[0]);
-          break;
-      }
-      ps.executeMultiByteCommand = 0;
-    }
-    return;
-  }
-
-  // New command byte.
-  uint8_t command;
-  if (inputData < 0xF0) {
-    command             = inputData & 0xF0;
-    ps.multiByteChannel = inputData & 0x0F;
-  } else {
-    command = inputData;
-  }
-
-  switch (command) {
-    case ANALOG_MESSAGE:
-    case DIGITAL_MESSAGE:
-    case SET_PIN_MODE:
-    case SET_DIGITAL_PIN_VALUE:
-      ps.waitForData = 2; ps.executeMultiByteCommand = command; break;
-    case REPORT_ANALOG:
-    case REPORT_DIGITAL:
-      ps.waitForData = 1; ps.executeMultiByteCommand = command; break;
-    case START_SYSEX:
-      ps.parsingSysex = true; ps.sysexBytesRead = 0; break;
-    case SYSTEM_RESET:
-      systemResetState(); break;
-    case REPORT_VERSION:
-      sendProtocolVersion(); break;
-    default:
-      break;  // ignore unknown command bytes
-  }
-}
-
-// ===========================================================================
-//  Firmata Scheduler  (SysEx 0x7B)
-//  Store tasks (recorded Firmata messages + delays) and replay them
-//  autonomously — even after the client disconnects. Wire format follows the
-//  official Firmata Scheduler protocol: Encoder7Bit packing for task data and
-//  32-bit times, and "a trailing DELAY_TASK loops the task".
-//  (SchedTask storage is declared earlier, near ParserState.)
-// ===========================================================================
-static SchedTask *schedFind(uint8_t id) {
-  for (uint8_t i = 0; i < MAX_TASKS; i++)
-    if (schedTasks[i].used && schedTasks[i].id == id) return &schedTasks[i];
-  return nullptr;
-}
-
-// Encoder7Bit decode: unpack `outBytes` 8-bit bytes from 7-bit `in`.
-static void sched7BitDecode(int outBytes, const uint8_t *in, uint8_t *out) {
-  for (int i = 0; i < outBytes; i++) {
-    int j = i << 3;
-    int pos = j / 7;
-    uint8_t shift = j % 7;
-    out[i] = (in[pos] >> shift) | ((in[pos + 1] << (7 - shift)) & 0xFF);
-  }
-}
-static inline int sched7BitOutBytes(int encodedLen) { return (encodedLen * 7) >> 3; }
-
-// Decode a 32-bit little-endian value from 5 Encoder7Bit-packed bytes.
-static uint32_t sched7BitTime(const uint8_t *enc5) {
-  uint8_t b[4];
-  sched7BitDecode(4, enc5, b);
-  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-}
-
-static void schedReset() {
-  for (uint8_t i = 0; i < MAX_TASKS; i++) schedTasks[i].used = false;
-  for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) schedReg[i] = 0;
-  runningTask = nullptr;
-}
-
-static void schedSendError(uint8_t id) {
-  uint8_t b[5] = { START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX };
-  sendFrame(b, 5);
-}
-
-static void schedCreate(uint8_t id, uint16_t len) {
-  if (schedFind(id) || len > MAX_TASK_BYTES) { schedSendError(id); return; }
-  for (uint8_t i = 0; i < MAX_TASKS; i++) {
-    if (!schedTasks[i].used) {
-      schedTasks[i].used = true; schedTasks[i].id = id;
-      schedTasks[i].time_ms = 0; schedTasks[i].len = len; schedTasks[i].pos = 0;
-      return;
-    }
-  }
-  schedSendError(id);  // no free slot
-}
-
-static void schedDelete(uint8_t id) {
-  SchedTask *t = schedFind(id);
-  if (t) { if (runningTask == t) runningTask = nullptr; t->used = false; }
-}
-
-static void schedAdd(uint8_t id, const uint8_t *data, int n) {
-  SchedTask *t = schedFind(id);
-  if (!t) { schedSendError(id); return; }
-  if ((int)t->pos + n > (int)t->len) return;  // would overflow reserved length
-  for (int i = 0; i < n; i++) t->data[t->pos++] = data[i];
-}
-
-static void schedSchedule(uint8_t id, uint32_t delayMs) {
-  SchedTask *t = schedFind(id);
-  if (!t) { schedSendError(id); return; }
-  t->pos = 0;
-  t->time_ms = millis() + delayMs;
-  if (t->time_ms == 0) t->time_ms = 1;        // reserve 0 for "not scheduled"
-}
-
-// A DELAY_TASK encountered while a task is executing.
-static void schedDelayRunning(uint32_t delayMs) {
-  if (!runningTask) return;
-  uint32_t now = millis();
-  runningTask->time_ms += delayMs;
-  if ((int32_t)(runningTask->time_ms - now) < 0) runningTask->time_ms = now;
-  if (runningTask->time_ms == 0) runningTask->time_ms = 1;
-}
-
-static void schedQueryAll() {
-  int n = 0;
-  frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_ALL_REPLY;
-  for (uint8_t i = 0; i < MAX_TASKS; i++)
-    if (schedTasks[i].used) frameBuf[n++] = schedTasks[i].id;
-  frameBuf[n++] = END_SYSEX;
-  sendFrame(frameBuf, n);
-}
-
-// Encoder7Bit encode one byte into frameBuf, carrying state in shift/prev.
-static void sched7BitPut(int &n, uint8_t &shift, uint8_t &prev, uint8_t d) {
-  if (shift == 0) { frameBuf[n++] = d & 0x7F; shift = 1; prev = d >> 7; }
-  else {
-    frameBuf[n++] = (uint8_t)((((uint16_t)d << shift) & 0x7F) | prev);
-    if (shift == 6) { frameBuf[n++] = d >> 1; shift = 0; }
-    else { shift++; prev = d >> (8 - shift); }
-  }
-}
-
-static void schedQueryTask(uint8_t id) {
-  SchedTask *t = schedFind(id);
-  if (!t) { schedSendError(id); return; }
-  int n = 0;
-  frameBuf[n++] = START_SYSEX; frameBuf[n++] = SCHEDULER_DATA; frameBuf[n++] = SCHED_QUERY_REPLY;
-  frameBuf[n++] = id;
-  // payload = time_ms(4 LE) + len(2 LE) + pos(2 LE) + data[len], Encoder7Bit-packed
-  uint8_t header[8] = {
-    (uint8_t)(t->time_ms), (uint8_t)(t->time_ms >> 8),
-    (uint8_t)(t->time_ms >> 16), (uint8_t)(t->time_ms >> 24),
-    (uint8_t)(t->len), (uint8_t)(t->len >> 8),
-    (uint8_t)(t->pos), (uint8_t)(t->pos >> 8)
-  };
-  uint8_t shift = 0, prev = 0;
-  for (int i = 0; i < 8; i++)             sched7BitPut(n, shift, prev, header[i]);
-  for (uint16_t i = 0; i < t->len; i++)   sched7BitPut(n, shift, prev, t->data[i]);
-  if (shift > 0) frameBuf[n++] = prev;
-  frameBuf[n++] = END_SYSEX;
-  sendFrame(frameBuf, n);
-}
-
-// ---- NON-STANDARD scheduler logic extension (see NONSTANDARD.md) ----------
-
-static bool schedCompare(uint8_t op, int32_t a, int32_t b) {
-  switch (op) {
-    case 0: return a == b;
-    case 1: return a != b;
-    case 2: return a <  b;
-    case 3: return a >  b;
-    case 4: return a <= b;
-    case 5: return a >= b;
-    default: return false;
-  }
-}
-
-// Read one IF operand starting at payload[i]; advances i. Type byte: 0=register
-// (1 byte index), 1=constant (5 Encoder7Bit bytes of an Int32).
-static int32_t schedReadOperand(const uint8_t *payload, int plen, int &i) {
-  if (i >= plen) return 0;
-  uint8_t type = payload[i++];
-  if (type == 0) {                                   // register
-    if (i >= plen) return 0;
-    return schedReg[payload[i++] & 0x0F];
-  } else {                                           // constant
-    if (i + 5 > plen) { i = plen; return 0; }
-    int32_t v = (int32_t)sched7BitTime(payload + i);
-    i += 5;
-    return v;
-  }
-}
-
-// Advance the running task's cursor by `skip` bytes (forward-only; clamped).
-static void schedSkip(uint16_t skip) {
-  if (!runningTask) return;
-  uint32_t p = (uint32_t)runningTask->pos + skip;
-  runningTask->pos = (p > runningTask->len) ? runningTask->len : (uint16_t)p;
-}
-
-// --- Internet action (see NONSTANDARD.md) -----------------------------------
-// A stored task (or a live host) makes an HTTP(S) request over the board's
-// Wi-Fi. ext payload: 0x15 method statusReg valueReg urlLo urlHi url[] bodyLo
-// bodyHi body[].  method 0=GET 1=POST. Stores HTTP status in R[statusReg]
-// (0 = Wi-Fi down/error) and the first integer of the body in R[valueReg]; if a
-// host is connected, status + body are sent back as SCHED_EXT_HTTP_REPLY.
-// HTTP only (see README for the HTTPS/TLS note). Blocks the loop until done.
-static String httpRespBody;
-
-// First (optionally signed) base-10 integer found in a buffer.
-static int32_t parseFirstInt(const uint8_t *buf, int n) {
-  int i = 0;
-  while (i < n && !(buf[i] >= '0' && buf[i] <= '9') && buf[i] != '-') i++;
-  if (i >= n) return 0;
-  bool neg = false;
-  if (buf[i] == '-') { neg = true; i++; }
-  int32_t v = 0; bool any = false;
-  while (i < n && buf[i] >= '0' && buf[i] <= '9') { v = v * 10 + (buf[i] - '0'); any = true; i++; }
-  if (!any) return 0;
-  return neg ? -v : v;
-}
-
-static void sendHttpReply(int status) {
-  int n = 0;
-  frameBuf[n++] = START_SYSEX;
-  frameBuf[n++] = SCHEDULER_DATA;
-  frameBuf[n++] = SCHED_EXT_HTTP_REPLY;
-  frameBuf[n++] = status & 0x7F;
-  frameBuf[n++] = (status >> 7) & 0x7F;
-  int rlen = httpRespBody.length();
-  if (rlen > HTTP_REPLY_MAX) rlen = HTTP_REPLY_MAX;
-  const char *body = httpRespBody.c_str();
-  for (int k = 0; k < rlen; k++) {           // 14-bit LSB/MSB pairs (like STRING_DATA)
-    frameBuf[n++] = (uint8_t)body[k] & 0x7F;
-    frameBuf[n++] = ((uint8_t)body[k] >> 7) & 0x7F;
-  }
-  frameBuf[n++] = END_SYSEX;
-  sendFrame(frameBuf, n);
-}
-
-static void schedDoHttp(const uint8_t *p, int plen) {
-  if (plen < 6) return;
-  uint8_t method   = p[1];
-  int     statusReg = p[2] & 0x0F;
-  int     valueReg  = p[3] & 0x0F;
-  int     urlLen    = p[4] | (p[5] << 7);
-  int i = 6;
-  if (urlLen <= 0 || i + urlLen > plen) return;
-  String url; url.reserve(urlLen + 1);
-  for (int k = 0; k < urlLen; k++) url += (char)p[i + k];
-  i += urlLen;
-  int bodyLen = 0;
-  if (i + 2 <= plen) { bodyLen = p[i] | (p[i + 1] << 7); i += 2; }
-  if (bodyLen < 0 || i + bodyLen > plen) bodyLen = 0;
-  String body; body.reserve(bodyLen + 1);
-  for (int k = 0; k < bodyLen; k++) body += (char)p[i + k];
-
-  httpRespBody = "";
-  int status = 0;
-#if ENABLE_WIFI
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.setConnectTimeout(8000);
-    http.setTimeout(8000);
-    http.setReuse(false);
-    WiFiClient client;                       // plain HTTP only (see README)
-    if (http.begin(client, url)) {
-      if (method == 1) {
-        http.addHeader("Content-Type", "application/json");
-        status = http.POST((uint8_t *)body.c_str(), body.length());
-      } else {
-        status = http.GET();
-      }
-      if (status > 0) httpRespBody = http.getString();
-      http.end();
-    }
-  }
-#endif
-  schedReg[statusReg] = status;
-
-  int rlen = httpRespBody.length();
-  if (rlen > 0) {
-    int m = rlen; if (m > HTTP_REPLY_MAX) m = HTTP_REPLY_MAX;
-    schedReg[valueReg] = parseFirstInt((const uint8_t *)httpRespBody.c_str(), m);
-  } else {
-    schedReg[valueReg] = 0;
-  }
-
-  if (transportConnected()) sendHttpReply(status);
-}
-
-static void schedHandleExt(const uint8_t *payload, int plen) {
-  switch (payload[0]) {
-    case SCHED_EXT_SET:               // 0x10 reg <const:5>
-      if (plen == 7) schedReg[payload[1] & 0x0F] = (int32_t)sched7BitTime(payload + 2);
-      break;
-    case SCHED_EXT_READ_DIGITAL:      // 0x11 reg pin
-      if (plen == 3) schedReg[payload[1] & 0x0F] = digitalRead(payload[2]) ? 1 : 0;
-      break;
-    case SCHED_EXT_READ_ANALOG: {     // 0x12 reg channel
-      if (plen == 3) {
-        int pin = pinOfAnalogChannel(payload[2]);
-        schedReg[payload[1] & 0x0F] = (pin >= 0) ? analogRead(pin) : 0;
-      }
-      break;
-    }
-    case SCHED_EXT_IF: {              // 0x13 op <operandA> <operandB> skipLo skipHi
-      int i = 1;
-      uint8_t op = payload[i++];
-      int32_t a = schedReadOperand(payload, plen, i);
-      int32_t b = schedReadOperand(payload, plen, i);
-      if (i + 2 > plen) break;
-      uint16_t skip = (uint16_t)(payload[i] | (payload[i + 1] << 7));
-      if (!schedCompare(op, a, b)) schedSkip(skip);   // condition false -> skip block
-      break;
-    }
-    case SCHED_EXT_SKIP:             // 0x14 skipLo skipHi  (unconditional; for else)
-      if (plen == 3) schedSkip((uint16_t)(payload[1] | (payload[2] << 7)));
-      break;
-    case SCHED_EXT_HTTP:            // 0x15 internet request (see NONSTANDARD.md)
-      schedDoHttp(payload, plen);
-      break;
-  }
-}
-
-static void schedHandleSysex(const uint8_t *payload, int plen) {
-  if (plen < 1) return;
-  switch (payload[0]) {
-    case SCHED_CREATE:
-      if (plen == 4) schedCreate(payload[1], (uint16_t)(payload[2] | (payload[3] << 7)));
-      break;
-    case SCHED_DELETE:
-      if (plen == 2) schedDelete(payload[1]);
-      break;
-    case SCHED_ADD:
-      if (plen > 2) {
-        int outLen = sched7BitOutBytes(plen - 2);
-        static uint8_t dec[MAX_TASK_BYTES];
-        if (outLen > (int)sizeof(dec)) outLen = sizeof(dec);
-        sched7BitDecode(outLen, payload + 2, dec);
-        schedAdd(payload[1], dec, outLen);
-      }
-      break;
-    case SCHED_DELAY:
-      if (plen == 6) schedDelayRunning(sched7BitTime(payload + 1));
-      break;
-    case SCHED_SCHEDULE:
-      if (plen == 7) schedSchedule(payload[1], sched7BitTime(payload + 2));
-      break;
-    case SCHED_EXT_COMMAND:            // 0x7F: our logic ops live under the
-      if (plen >= 2) schedHandleExt(payload + 1, plen - 1);  // reserved extension cmd
-      break;
-    case SCHED_QUERY_ALL: schedQueryAll(); break;
-    case SCHED_QUERY:     if (plen == 2) schedQueryTask(payload[1]); break;
-    case SCHED_RESET:     schedReset(); break;
-    default: break;
-  }
-}
-
-// Replay a task's bytes through the task parser until a delay reschedules it or
-// it finishes. Returns true if the task should be kept (rescheduled / looping).
-static bool schedExecute(SchedTask *t) {
-  uint32_t start = t->time_ms;
-  runningTask = t;
-  taskParser = ParserState();                 // each run resumes at a message boundary
-  while (t->pos < t->len) {
-    processByte(taskParser, t->data[t->pos++]);
-    if (t->time_ms != start) {                // a DELAY_TASK fired
-      if (t->pos >= t->len) t->pos = 0;       // trailing delay -> loop from the start
-      runningTask = nullptr;
-      return true;
-    }
-  }
-  runningTask = nullptr;
-  return false;                               // ran to the end with no trailing delay -> one-shot
-}
-
-static void schedTick() {
-  uint32_t now = millis();
-  for (uint8_t i = 0; i < MAX_TASKS; i++) {
-    SchedTask *t = &schedTasks[i];
-    if (t->used && t->time_ms != 0 && (int32_t)(now - t->time_ms) >= 0) {
-      if (!schedExecute(t)) t->used = false;  // one-shot finished -> free the slot
-    }
-  }
-}
+// Singletons: live handler, replay handler (for task playback), and scheduler.
+// Cross-references are wired once in setup().
+static Scheduler       scheduler;
+static FirmataProtocol liveHandler;
+static FirmataProtocol replayHandler;
 
 // ===========================================================================
 //  Periodic sampling (device -> host)
@@ -1121,7 +1131,7 @@ static void sampleAnalogAndI2C() {
 // state but PRESERVES pin modes/values and any running scheduler tasks, so a
 // queued task keeps running across client disconnect/reconnect.
 static void resetSessionState() {
-  liveParser = ParserState();
+  liveHandler.ps = ParserState();
   analogReportMask = 0;
   for (uint8_t i = 0; i < NUM_PORTS; i++) { reportPort[i] = false; previousPort[i] = 0; }
   for (uint8_t i = 0; i < MAX_CONT_READS; i++) contReads[i].active = false;
@@ -1131,8 +1141,8 @@ static void resetSessionState() {
 // and deletes all scheduler tasks.
 static void systemResetState() {
   resetSessionState();
-  taskParser = ParserState();
-  schedReset();
+  replayHandler.ps = ParserState();
+  scheduler.reset();
   for (uint8_t pin = 0; pin < TOTAL_PINS; pin++) {
     if (isUsable(pin)) pinMode(pin, INPUT);
     pinModes[pin]      = PIN_MODE_INPUT;
@@ -1256,7 +1266,7 @@ static void tcpPoll() {
     activeTransport = TR_NONE;
   }
   for (int guard = 0; tcpClient && tcpClient.available() && guard < 1024; guard++) {
-    processByte(liveParser, (uint8_t)tcpClient.read());
+    liveHandler.process((uint8_t)tcpClient.read());
   }
 }
 
@@ -1393,7 +1403,7 @@ static void blePoll() {
   }
   int b;
   int guard = 0;
-  while ((b = rxDequeue()) >= 0 && guard++ < 4096) processByte(liveParser, (uint8_t)b);
+  while ((b = rxDequeue()) >= 0 && guard++ < 4096) liveHandler.process((uint8_t)b);
 }
 
 static void bleSend(const uint8_t *buf, size_t len) {
@@ -1478,6 +1488,11 @@ void setup() {
   analogSetAttenuation(ADC_11db);
 #endif
 
+  // Wire the handler/scheduler cross-references (singletons that live forever).
+  liveHandler.sched   = &scheduler;
+  replayHandler.sched = &scheduler;
+  scheduler.replay    = &replayHandler;
+
   systemResetState();
   transportInit();
 }
@@ -1487,7 +1502,7 @@ void loop() {
 
   // Scheduler runs whether or not a client is connected — that is the whole
   // point: queue a task, disconnect, and the board keeps executing it.
-  schedTick();
+  scheduler.tick();
 
   if (transportConnected()) {
     checkDigitalInputs();
