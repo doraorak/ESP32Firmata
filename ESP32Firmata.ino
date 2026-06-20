@@ -80,6 +80,7 @@
 #if ENABLE_WIFI
   #include <WiFi.h>
   #include <ESPmDNS.h>
+  #include <HTTPClient.h>   // internet actions (scheduler extension)
 #endif
 #if ENABLE_BLE
   #include <BLEDevice.h>
@@ -130,6 +131,7 @@ static const uint8_t SCHED_RESET           = 0x07;
 static const uint8_t SCHED_ERROR_REPLY     = 0x08;
 static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
 static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
+static const uint8_t SCHED_EXT_HTTP_REPLY  = 0x0B;   // device -> host: HTTP status + body
 
 // --- Logic extension (see NONSTANDARD.md) -----------------------------------
 // On-device registers + if/else so a stored task can make decisions by itself.
@@ -141,6 +143,7 @@ static const uint8_t SCHED_EXT_READ_DIGITAL = 0x11;  // R[d] = digitalRead(pin)
 static const uint8_t SCHED_EXT_READ_ANALOG  = 0x12;  // R[d] = analogRead(channel)
 static const uint8_t SCHED_EXT_IF           = 0x13;  // if !(a op b) skip N bytes
 static const uint8_t SCHED_EXT_SKIP         = 0x14;  // unconditional skip N bytes
+static const uint8_t SCHED_EXT_HTTP         = 0x15;  // make an HTTP request over Wi-Fi
 
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
@@ -170,7 +173,7 @@ static const uint8_t I2C_SCL_PIN = 22;
 //  function so Arduino's auto-generated prototypes (inserted just above the
 //  first function) can see them.
 // ===========================================================================
-static const int SYSEX_MAX = 256;
+static const int SYSEX_MAX = 512;   // fits an HTTP op's URL + body in one SysEx
 
 // Firmata input-parser state. Two independent instances exist: one for the live
 // host connection and one for replaying scheduler tasks — so a half-received
@@ -267,7 +270,8 @@ static const uint8_t NUM_SCHED_REGS = 16;
 static int32_t       schedReg[NUM_SCHED_REGS];
 
 // Scratch buffer used to build outgoing frames.
-static uint8_t   frameBuf[1024];
+static uint8_t   frameBuf[2048];                 // sized for HTTP response bodies
+static const int HTTP_REPLY_MAX = 768;           // max HTTP body bytes echoed to host
 
 // ===========================================================================
 //  Dual-transport master arbitration (latest-wins)
@@ -885,6 +889,97 @@ static void schedSkip(uint16_t skip) {
   runningTask->pos = (p > runningTask->len) ? runningTask->len : (uint16_t)p;
 }
 
+// --- Internet action (see NONSTANDARD.md) -----------------------------------
+// A stored task (or a live host) makes an HTTP(S) request over the board's
+// Wi-Fi. ext payload: 0x15 method statusReg valueReg urlLo urlHi url[] bodyLo
+// bodyHi body[].  method 0=GET 1=POST. Stores HTTP status in R[statusReg]
+// (0 = Wi-Fi down/error) and the first integer of the body in R[valueReg]; if a
+// host is connected, status + body are sent back as SCHED_EXT_HTTP_REPLY.
+// HTTP only (see README for the HTTPS/TLS note). Blocks the loop until done.
+static String httpRespBody;
+
+// First (optionally signed) base-10 integer found in a buffer.
+static int32_t parseFirstInt(const uint8_t *buf, int n) {
+  int i = 0;
+  while (i < n && !(buf[i] >= '0' && buf[i] <= '9') && buf[i] != '-') i++;
+  if (i >= n) return 0;
+  bool neg = false;
+  if (buf[i] == '-') { neg = true; i++; }
+  int32_t v = 0; bool any = false;
+  while (i < n && buf[i] >= '0' && buf[i] <= '9') { v = v * 10 + (buf[i] - '0'); any = true; i++; }
+  if (!any) return 0;
+  return neg ? -v : v;
+}
+
+static void sendHttpReply(int status) {
+  int n = 0;
+  frameBuf[n++] = START_SYSEX;
+  frameBuf[n++] = SCHEDULER_DATA;
+  frameBuf[n++] = SCHED_EXT_HTTP_REPLY;
+  frameBuf[n++] = status & 0x7F;
+  frameBuf[n++] = (status >> 7) & 0x7F;
+  int rlen = httpRespBody.length();
+  if (rlen > HTTP_REPLY_MAX) rlen = HTTP_REPLY_MAX;
+  const char *body = httpRespBody.c_str();
+  for (int k = 0; k < rlen; k++) {           // 14-bit LSB/MSB pairs (like STRING_DATA)
+    frameBuf[n++] = (uint8_t)body[k] & 0x7F;
+    frameBuf[n++] = ((uint8_t)body[k] >> 7) & 0x7F;
+  }
+  frameBuf[n++] = END_SYSEX;
+  sendFrame(frameBuf, n);
+}
+
+static void schedDoHttp(const uint8_t *p, int plen) {
+  if (plen < 6) return;
+  uint8_t method   = p[1];
+  int     statusReg = p[2] & 0x0F;
+  int     valueReg  = p[3] & 0x0F;
+  int     urlLen    = p[4] | (p[5] << 7);
+  int i = 6;
+  if (urlLen <= 0 || i + urlLen > plen) return;
+  String url; url.reserve(urlLen + 1);
+  for (int k = 0; k < urlLen; k++) url += (char)p[i + k];
+  i += urlLen;
+  int bodyLen = 0;
+  if (i + 2 <= plen) { bodyLen = p[i] | (p[i + 1] << 7); i += 2; }
+  if (bodyLen < 0 || i + bodyLen > plen) bodyLen = 0;
+  String body; body.reserve(bodyLen + 1);
+  for (int k = 0; k < bodyLen; k++) body += (char)p[i + k];
+
+  httpRespBody = "";
+  int status = 0;
+#if ENABLE_WIFI
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    http.setReuse(false);
+    WiFiClient client;                       // plain HTTP only (see README)
+    if (http.begin(client, url)) {
+      if (method == 1) {
+        http.addHeader("Content-Type", "application/json");
+        status = http.POST((uint8_t *)body.c_str(), body.length());
+      } else {
+        status = http.GET();
+      }
+      if (status > 0) httpRespBody = http.getString();
+      http.end();
+    }
+  }
+#endif
+  schedReg[statusReg] = status;
+
+  int rlen = httpRespBody.length();
+  if (rlen > 0) {
+    int m = rlen; if (m > HTTP_REPLY_MAX) m = HTTP_REPLY_MAX;
+    schedReg[valueReg] = parseFirstInt((const uint8_t *)httpRespBody.c_str(), m);
+  } else {
+    schedReg[valueReg] = 0;
+  }
+
+  if (transportConnected()) sendHttpReply(status);
+}
+
 static void schedHandleExt(const uint8_t *payload, int plen) {
   switch (payload[0]) {
     case SCHED_EXT_SET:               // 0x10 reg <const:5>
@@ -912,6 +1007,9 @@ static void schedHandleExt(const uint8_t *payload, int plen) {
     }
     case SCHED_EXT_SKIP:             // 0x14 skipLo skipHi  (unconditional; for else)
       if (plen == 3) schedSkip((uint16_t)(payload[1] | (payload[2] << 7)));
+      break;
+    case SCHED_EXT_HTTP:            // 0x15 internet request (see NONSTANDARD.md)
+      schedDoHttp(payload, plen);
       break;
   }
 }

@@ -10,7 +10,8 @@ dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,
 BLE — so a client can connect either way with no reflashing.
 
 > **Branches:** `main` (this one) includes the **Scheduler logic extension**
-> (registers + `if`/`else`, documented below). The
+> (registers + `if`/`else`) **and internet actions** (HTTP over Wi-Fi), documented
+> below. The
 > [`no-extension`](https://github.com/doraorak/ESP32Firmata/tree/no-extension)
 > branch is the standard-compliant firmware (Scheduler only, no logic ops).
 
@@ -34,7 +35,9 @@ survive eviction/disconnect.
 * **Scheduler** (SysEx `0x7B`) — store tasks and run them autonomously, even after
   the client disconnects (create / add / schedule / delay / query / reset,
   Encoder7Bit packing, "trailing delay loops the task"; up to 8 tasks, 512 B each)
-* **On-device logic extension** (this branch) — see *Custom protocol* below
+* **On-device logic extension** (this branch) — 16 registers + `if`/`else`
+* **Internet actions** (this branch) — a task (or live host) makes HTTP requests
+  over Wi-Fi and branches on the result; see *Custom protocol* below
 
 ### Pin map (typical ESP32 dev board)
 * **Full digital** (INPUT / PULLUP / OUTPUT / PWM): GPIO 0, 2, 4, 5, 12–19, 21–23, 25–27, 32, 33
@@ -95,6 +98,13 @@ board.schedule(rec, afterMs: 0)
 | `readDigital(pin:, into: d)` | `R[d] = digitalRead(pin)` |
 | `readAnalog(channel:, into: d)` | `R[d] = analogRead(channel)` |
 | `ifTrue(_:_:_:then:elseDo:)` | compare two operands; run `then`, else `elseDo` |
+| `httpGet(_ url, statusInto: s, valueInto: v)` | HTTP GET over Wi-Fi; `R[s]`=status, `R[v]`=first int in body |
+| `httpPost(_ url, body:, statusInto: s, valueInto: v)` | as above, POST with a JSON body |
+
+So a task can fetch a value from the internet and act on it with no host
+connected — e.g. `httpGet` a sensor endpoint, then `ifTrue` on `R[v]` to drive a
+pin. The client can also call `httpGet`/`httpPost` **live** and get the
+`HTTPResponse` (status + body) back. **Wi-Fi required; HTTP only** (see below).
 
 ### Byte commands (wire format)
 
@@ -109,12 +119,20 @@ READ_DIGITAL  F0 7B 7F 11 <reg> <pin>                         F7   // R[reg] = d
 READ_ANALOG   F0 7B 7F 12 <reg> <channel>                     F7   // R[reg] = analogRead(channel)
 IF            F0 7B 7F 13 <op> <operandA> <operandB> <skip:2> F7   // if !(A op B): pos += skip
 SKIP          F0 7B 7F 14 <skip:2>                            F7   // pos += skip (else)
+HTTP          F0 7B 7F 15 <method> <statusReg> <valueReg> <urlLen:2> <url…> <bodyLen:2> <body…> F7
+HTTP_REPLY    F0 7B 0B <status:2> <body 14-bit pairs…>        F7   // device -> host (if connected)
 ```
 
 * `<reg>`: register index, low nibble (`0`–`15`).
 * `<op>`: `0 ==`, `1 !=`, `2 <`, `3 >`, `4 <=`, `5 >=`.
 * `<operand>`: a type byte then data — `00 <reg>` (register) or `01 <const:5>` (literal).
 * `<pin>`: GPIO number. `<channel>`: analog channel index (A0 = 0…), **not a pin**.
+* `HTTP` (`0x15`): `<method>` `0`=GET `1`=POST; `<urlLen>`/`<bodyLen>` 14-bit LE
+  (`lo hi`); `<url>`/`<body>` raw 7-bit ASCII. Makes the request over Wi-Fi and sets
+  `R[statusReg]` = HTTP status (`0` on failure), `R[valueReg]` = first integer in the
+  body. POST sends `Content-Type: application/json`. `HTTP_REPLY` carries status
+  (`lo hi`) + body (14-bit pairs) back to a connected host. **HTTP only** —
+  `https://` needs a TLS client (`NetworkClientSecure`/`ssl_client`) linked in.
 
 `if`/`else` is laid out so the byte counts line up:
 `[IF skip=thenLen] [then bytes] [SKIP skip=elseLen] [else bytes]` — a false `IF`
