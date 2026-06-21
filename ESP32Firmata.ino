@@ -88,10 +88,8 @@
   extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 #endif
 #if ENABLE_BLE
-  #include <BLEDevice.h>
-  #include <BLEServer.h>
-  #include <BLEUtils.h>
-  #include <BLE2902.h>
+  #include <NimBLEDevice.h>   // NimBLE uses far less heap than Bluedroid — leaves
+                              // room for a TLS (HTTPS) handshake alongside Wi-Fi.
 #endif
 #include <Wire.h>
 
@@ -1482,8 +1480,8 @@ static void tcpPoll() {
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // host -> device
 #define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // device -> host
 
-static BLEServer         *bleServer = nullptr;
-static BLECharacteristic *txChar    = nullptr;
+static NimBLEServer         *bleServer = nullptr;
+static NimBLECharacteristic *txChar    = nullptr;
 static volatile bool      bleConnected = false;   // a central currently holds the link
 static volatile uint16_t  bleConnId   = 0;        // its connection id
 static volatile bool      bleNewConnect = false;  // edge flag: a central just connected
@@ -1513,73 +1511,63 @@ static int rxDequeue() {
   return r;
 }
 
-class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    uint8_t *d = c->getData();
-    size_t   n = c->getLength();
-    if (d && n) rxEnqueue(d, n);
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+    NimBLEAttValue v = c->getValue();
+    if (v.length()) rxEnqueue(v.data(), v.length());
   }
 };
 
-class ServerCallbacks : public BLEServerCallbacks {
-  // Use the conn-id overloads so we can do latest-wins across multiple centrals.
-  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
-    uint16_t newConn = param->connect.conn_id;
+class ServerCallbacks : public NimBLEServerCallbacks {
+  // Use the conn handle so we can do latest-wins across multiple centrals.
+  void onConnect(NimBLEServer *s, NimBLEConnInfo &connInfo) override {
+    uint16_t newConn = connInfo.getConnHandle();
     if (bleConnected && bleConnId != newConn) {
       s->disconnect(bleConnId);     // a new central wins: drop the previous one
     }
     bleConnId     = newConn;
     bleConnected  = true;
     bleNewConnect = true;           // loop() will claim mastership
-    s->startAdvertising();          // keep advertising so the board stays reclaimable
+    NimBLEDevice::startAdvertising();  // keep advertising so the board stays reclaimable
   }
-  void onDisconnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
-    if (param->disconnect.conn_id == bleConnId) {  // the *current* master left
+  void onDisconnect(NimBLEServer *s, NimBLEConnInfo &connInfo, int reason) override {
+    if (connInfo.getConnHandle() == bleConnId) {   // the *current* master left
       bleConnected = false;
       negotiatedMTU = 23;
     }
-    s->startAdvertising();
+    NimBLEDevice::startAdvertising();
   }
-  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
-    negotiatedMTU = param->mtu.mtu;
+  void onMTUChange(uint16_t MTU, NimBLEConnInfo &) override {
+    negotiatedMTU = MTU;
   }
 };
 
 static void bleInit() {
-  BLEDevice::init(BLE_DEVICE_NAME);
-  BLEDevice::setMTU(517);  // request a large MTU (host has final say)
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setMTU(517);  // request a large MTU (host has final say)
 
-  bleServer = BLEDevice::createServer();
+  bleServer = NimBLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
 
-  BLEService *svc = bleServer->createService(NUS_SERVICE_UUID);
+  NimBLEService *svc = bleServer->createService(NUS_SERVICE_UUID);
 
-  BLECharacteristic *rxChar = svc->createCharacteristic(
-      NUS_RX_UUID,
-      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  NimBLECharacteristic *rxChar = svc->createCharacteristic(
+      NUS_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   rxChar->setCallbacks(new RxCallbacks());
 
-  txChar = svc->createCharacteristic(
-      NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  txChar->addDescriptor(new BLE2902());
+  // NimBLE auto-adds the 0x2902 CCCD for a NOTIFY characteristic.
+  txChar = svc->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
 
   svc->start();
 
-  // Put the 128-bit service UUID in the advertisement (required for the
-  // client's service-filtered scan); carry the name in the scan response so
-  // both fit inside the 31-byte limit.
-  BLEAdvertising *adv = BLEDevice::getAdvertising();
-  BLEAdvertisementData advData;
-  advData.setFlags(0x06);
-  advData.setCompleteServices(BLEUUID(NUS_SERVICE_UUID));
-  BLEAdvertisementData scanResp;
-  scanResp.setName(BLE_DEVICE_NAME);
-  adv->setAdvertisementData(advData);
-  adv->setScanResponseData(scanResp);
-  adv->setMinPreferred(0x06);
-  adv->setMinPreferred(0x12);
-
-  BLEDevice::startAdvertising();
+  // The 128-bit service UUID goes in the advertisement (required for the client's
+  // service-filtered scan); the name rides in the scan response so both fit the
+  // 31-byte limit (NimBLE moves the name there when scan response is enabled).
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->setName(BLE_DEVICE_NAME);
+  adv->enableScanResponse(true);
+  NimBLEDevice::startAdvertising();
   Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 }
 

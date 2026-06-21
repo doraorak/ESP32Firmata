@@ -50,11 +50,14 @@ survive eviction/disconnect.
 
 1. **Arduino IDE** → install **esp32 by Espressif** (core **3.x** recommended;
    PWM uses the core's `analogWrite`).
-2. Open `ESP32Firmata.ino`; set `WIFI_SSID` / `WIFI_PASS` in the USER
+2. **Library Manager** → install **NimBLE-Arduino** (≥ 2.x) — the BLE transport
+   uses NimBLE (lighter than Bluedroid, so `https://` fits alongside Wi-Fi + BLE).
+   Not needed if you build with `ENABLE_BLE 0`.
+3. Open `ESP32Firmata.ino`; set `WIFI_SSID` / `WIFI_PASS` in the USER
    CONFIGURATION block (and optionally set `ENABLE_WIFI`/`ENABLE_BLE` to `0`).
-3. **Board**: *ESP32 Dev Module*. **Partition Scheme**: *Huge APP (3 MB)*
-   recommended — the dual Wi-Fi+BLE build fills ~98% of *Minimal SPIFFS*.
-4. Upload; open Serial Monitor @ **115200** for IP / advertising status.
+4. **Board**: *ESP32 Dev Module*. **Partition Scheme**: *Huge APP (3 MB)*
+   recommended (the build is large; NimBLE keeps it well under the limit).
+5. Upload; open Serial Monitor @ **115200** for IP / advertising status.
 
 ## Connecting
 
@@ -111,15 +114,13 @@ e.g. `httpGet` a quote endpoint, `jsonNumber("changePercent", scaledBy: 2)`, the
 `httpPost` **live** and inspect the `HTTPResponse` (status + body) on the host with
 `HTTPResponse.json()` / `.decode(_:)`.
 
-> **HTTPS heap note.** `https://` is validated against the IDF cert bundle and
-> works **out of the box in the Wi-Fi-only build** (`ENABLE_BLE 0`). In the **dual
-> Wi-Fi + BLE build**, Bluedroid leaves only ~40 KB heap — too little for the
-> Arduino core's TLS buffers (its prebuilt mbedtls has `ASYMMETRIC_CONTENT_LEN`
-> off, so it needs ~32 KB), so an `https://` request fails with `SSL - Memory
-> allocation failed` while `http://` still works. For HTTPS **with** BLE, use the
-> [ESP32FirmataSwift](https://github.com/doraorak/ESP32FirmataSwift) firmware (its
-> ESP-IDF build uses asymmetric TLS buffers and fits). The JSON/string inspection
-> ops work in **all** builds (they operate on whatever body was retained).
+> **HTTPS** is validated against the IDF cert bundle and works in the **dual
+> Wi-Fi + BLE build**. This needs the BLE stack to be **NimBLE**, not Bluedroid —
+> Bluedroid leaves only ~40 KB free heap, too little for the Arduino core's TLS
+> buffers (its prebuilt mbedtls has `ASYMMETRIC_CONTENT_LEN` off → ~32 KB), so a
+> handshake fails with `SSL - Memory allocation failed`. NimBLE frees enough heap
+> (and ~480 KB of flash). This sketch uses NimBLE — see *Setup* for the one-time
+> library install.
 
 ### Byte commands (wire format)
 
@@ -167,11 +168,11 @@ The base Scheduler control messages (`CREATE_TASK` `0x00`, `ADD_TO_TASK` `0x02`,
 are unchanged from standard Firmata.
 
 ## Verified
-* Dual build (Wi-Fi + BLE) compiles (`min_spiffs`, ~98% flash; use *Huge APP* for
-  headroom); single-transport builds also compile.
+* Dual build (Wi-Fi + BLE, NimBLE) compiles (`huge_app`, ~46% flash) and boots:
+  Wi-Fi + Bonjour up and BLE advertising at the same time.
 * Latest-wins eviction, Scheduler, digital/analog I/O and the logic extension
   verified live against the board.
-* Internet actions verified live: `http://` GET returns status + body in the dual
-  build; `https://` (cert-validated) GET returns 200 + body in the Wi-Fi-only build.
-  The JSON/string inspection ops are a direct port of the (hardware-verified)
-  ESP32FirmataSwift implementation.
+* Internet actions verified live in the **dual** build: `http://` and
+  **`https://` (cert-validated)** GET both return 200 + body — e.g. example.com
+  (559 B) and api JSON (83 B). The JSON/string inspection ops mirror the
+  (hardware-verified) ESP32FirmataSwift implementation.
