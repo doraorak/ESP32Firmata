@@ -80,7 +80,12 @@
 #if ENABLE_WIFI
   #include <WiFi.h>
   #include <ESPmDNS.h>
-  #include <HTTPClient.h>   // internet actions (scheduler extension)
+  #include <HTTPClient.h>          // internet actions (scheduler extension)
+  #include <WiFiClientSecure.h>    // HTTPS (TLS via ssl_client / mbedTLS)
+  // IDF certificate bundle (browser-like root CA set) — validates HTTPS certs.
+  // The arduino-esp32 core embeds it (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE).
+  extern const uint8_t fm_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+  extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 #endif
 #if ENABLE_BLE
   #include <BLEDevice.h>
@@ -143,7 +148,12 @@ static const uint8_t SCHED_EXT_READ_DIGITAL = 0x11;  // R[d] = digitalRead(pin)
 static const uint8_t SCHED_EXT_READ_ANALOG  = 0x12;  // R[d] = analogRead(channel)
 static const uint8_t SCHED_EXT_IF           = 0x13;  // if !(a op b) skip N bytes
 static const uint8_t SCHED_EXT_SKIP         = 0x14;  // unconditional skip N bytes
-static const uint8_t SCHED_EXT_HTTP         = 0x15;  // make an HTTP request over Wi-Fi
+static const uint8_t SCHED_EXT_HTTP         = 0x15;  // make an HTTP(S) request over Wi-Fi
+// Response-inspection ops (operate on the last HTTP response body):
+static const uint8_t SCHED_EXT_JSON_NUM         = 0x16;  // R[dst]=json number at path x10^scale; R[found]
+static const uint8_t SCHED_EXT_JSON_STR_EQ      = 0x17;  // R[dst]=(json string at path == s)?1:0
+static const uint8_t SCHED_EXT_BODY_CONTAINS    = 0x18;  // R[dst]=body contains s?1:0
+static const uint8_t SCHED_EXT_JSON_STR_CONTAINS = 0x19; // R[dst]=(json string at path contains s)?1:0
 
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
@@ -262,8 +272,9 @@ static ContinuousRead contReads[MAX_CONT_READS];
 static const uint8_t NUM_SCHED_REGS = 16;
 
 // Scratch buffer used to build outgoing frames.
-static uint8_t   frameBuf[2048];                 // sized for HTTP response bodies
-static const int HTTP_REPLY_MAX = 768;           // max HTTP body bytes echoed to host
+static uint8_t   frameBuf[2048];
+// Max response bytes retained for JSON/string inspection AND echoed to a host.
+static const int HTTP_PARSE_MAX = 4096;
 
 // ===========================================================================
 //  Dual-transport master arbitration (latest-wins)
@@ -750,19 +761,6 @@ class Scheduler {
     }
   }
 
-  // First (optionally signed) base-10 integer found in a buffer.
-  int32_t parseFirstInt(const uint8_t *buf, int n) {
-    int i = 0;
-    while (i < n && !(buf[i] >= '0' && buf[i] <= '9') && buf[i] != '-') i++;
-    if (i >= n) return 0;
-    bool neg = false;
-    if (buf[i] == '-') { neg = true; i++; }
-    int32_t v = 0; bool any = false;
-    while (i < n && buf[i] >= '0' && buf[i] <= '9') { v = v * 10 + (buf[i] - '0'); any = true; i++; }
-    if (!any) return 0;
-    return neg ? -v : v;
-  }
-
   void reset() {
     for (uint8_t i = 0; i < MAX_TASKS; i++) tasks[i].used = false;
     for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) regs[i] = 0;
@@ -883,35 +881,224 @@ class Scheduler {
 
   // Send the last HTTP result (status + body) to the connected host.
   void sendHttpReply(int status) {
-    int n = 0;
-    frameBuf[n++] = START_SYSEX;
-    frameBuf[n++] = SCHEDULER_DATA;
-    frameBuf[n++] = SCHED_EXT_HTTP_REPLY;
-    frameBuf[n++] = status & 0x7F;
-    frameBuf[n++] = (status >> 7) & 0x7F;
     int rlen = httpRespBody.length();
-    if (rlen > HTTP_REPLY_MAX) rlen = HTTP_REPLY_MAX;
+    if (rlen > HTTP_PARSE_MAX) rlen = HTTP_PARSE_MAX;
+    // Dedicated buffer (frameBuf is only 2 KB): header + body as 14-bit pairs.
+    uint8_t *out = (uint8_t *)malloc((size_t)rlen * 2 + 8);
+    if (!out) return;
+    int n = 0;
+    out[n++] = START_SYSEX;
+    out[n++] = SCHEDULER_DATA;
+    out[n++] = SCHED_EXT_HTTP_REPLY;
+    out[n++] = status & 0x7F;
+    out[n++] = (status >> 7) & 0x7F;
     const char *body = httpRespBody.c_str();
     for (int k = 0; k < rlen; k++) {           // 14-bit LSB/MSB pairs (like STRING_DATA)
-      frameBuf[n++] = (uint8_t)body[k] & 0x7F;
-      frameBuf[n++] = ((uint8_t)body[k] >> 7) & 0x7F;
+      out[n++] = (uint8_t)body[k] & 0x7F;
+      out[n++] = ((uint8_t)body[k] >> 7) & 0x7F;
     }
-    frameBuf[n++] = END_SYSEX;
-    sendFrame(frameBuf, n);
+    out[n++] = END_SYSEX;
+    sendFrame(out, n);
+    free(out);
   }
 
-  // Internet action: a task (or live host) makes an HTTP request over Wi-Fi.
-  // ext payload: 0x15 method statusReg valueReg urlLo urlHi url[] bodyLo bodyHi body[].
-  // method 0=GET 1=POST. Stores HTTP status in R[statusReg] (0 = Wi-Fi down/error)
-  // and the first integer of the body in R[valueReg]; if a host is connected,
-  // status + body are returned as SCHED_EXT_HTTP_REPLY. HTTP only (see README).
-  void doHttp(const uint8_t *p, int plen) {
+  // ====== minimal JSON walker over a byte buffer (mirrors the Swift firmware) ==
+  int jsonSkipWs(const uint8_t *b, int blen, int i) {
+    while (i < blen && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r')) i++;
+    return i;
+  }
+  int jsonSkipString(const uint8_t *b, int blen, int i) {   // i at opening quote
+    int j = i + 1;
+    while (j < blen) {
+      if (b[j] == '\\') { j += 2; continue; }                // backslash escape
+      if (b[j] == '"') return j + 1;
+      j++;
+    }
+    return j;
+  }
+  int jsonSkipValue(const uint8_t *b, int blen, int i) {
+    int j = jsonSkipWs(b, blen, i);
+    if (j >= blen) return j;
+    uint8_t c = b[j];
+    if (c == '"') return jsonSkipString(b, blen, j);
+    if (c == '{' || c == '[') {
+      uint8_t open = c, close = (c == '{') ? '}' : ']';
+      int k = j + 1, depth = 1;
+      while (k < blen && depth > 0) {
+        uint8_t d = b[k];
+        if (d == '"') { k = jsonSkipString(b, blen, k); continue; }
+        if (d == open) depth++; else if (d == close) depth--;
+        k++;
+      }
+      return k;
+    }
+    int k = j;                                               // number/true/false/null
+    while (k < blen) {
+      uint8_t d = b[k];
+      if (d == ',' || d == '}' || d == ']' || d == ' ' || d == '\t' || d == '\n' || d == '\r') break;
+      k++;
+    }
+    return k;
+  }
+  int jsonObjectMember(const uint8_t *b, int blen, int pos, const uint8_t *key, int keylen) {
+    int j = jsonSkipWs(b, blen, pos);
+    if (j >= blen || b[j] != '{') return -1;
+    j++;
+    while (true) {
+      j = jsonSkipWs(b, blen, j);
+      if (j >= blen || b[j] == '}') return -1;
+      if (b[j] != '"') return -1;
+      int ks = j + 1;
+      int after = jsonSkipString(b, blen, j); int ke = after - 1;
+      bool match = (ke - ks) == keylen;
+      if (match) { for (int t = 0; t < keylen; t++) if (b[ks + t] != key[t]) { match = false; break; } }
+      j = jsonSkipWs(b, blen, after);
+      if (j >= blen || b[j] != ':') return -1;
+      j = jsonSkipWs(b, blen, j + 1);
+      if (match) return j;
+      j = jsonSkipWs(b, blen, jsonSkipValue(b, blen, j));
+      if (j < blen && b[j] == ',') { j++; continue; }
+      return -1;
+    }
+  }
+  int jsonArrayElement(const uint8_t *b, int blen, int pos, int idx) {
+    int j = jsonSkipWs(b, blen, pos);
+    if (j >= blen || b[j] != '[') return -1;
+    j++;
+    int cur = 0;
+    while (true) {
+      j = jsonSkipWs(b, blen, j);
+      if (j >= blen || b[j] == ']') return -1;
+      if (cur == idx) return j;
+      j = jsonSkipWs(b, blen, jsonSkipValue(b, blen, j));
+      if (j < blen && b[j] == ',') { j++; cur++; continue; }
+      return -1;
+    }
+  }
+  // Resolve a dotted/indexed path (e.g. "a.b[0].c") to the value's byte span.
+  bool jsonValueSpan(const uint8_t *b, int blen, const uint8_t *path, int pathlen,
+                     int &outStart, int &outEnd) {
+    if (blen <= 0) return false;
+    int pos = jsonSkipWs(b, blen, 0);
+    int pi = 0;
+    while (true) {
+      if (pi >= pathlen) { outStart = pos; outEnd = jsonSkipValue(b, blen, pos); return true; }
+      if (path[pi] == '.') { pi++; continue; }
+      if (path[pi] == '[') {                                 // array index
+        pi++; int idx = 0;
+        while (pi < pathlen && path[pi] >= '0' && path[pi] <= '9') { idx = idx * 10 + (path[pi] - '0'); pi++; }
+        if (pi < pathlen && path[pi] == ']') pi++;
+        int p2 = jsonArrayElement(b, blen, pos, idx);
+        if (p2 < 0) return false;
+        pos = p2;
+      } else {                                               // object key
+        int ks = pi;
+        while (pi < pathlen && path[pi] != '.' && path[pi] != '[') pi++;
+        int p2 = jsonObjectMember(b, blen, pos, path + ks, pi - ks);
+        if (p2 < 0) return false;
+        pos = p2;
+      }
+    }
+  }
+  // Parse a JSON number at b[i0] into value × 10^scale (truncated). false if not a number.
+  bool parseScaledNumber(const uint8_t *b, int blen, int i0, int scale, int32_t &out) {
+    int i = jsonSkipWs(b, blen, i0);
+    if (i >= blen) return false;
+    bool neg = false;
+    if (b[i] == '-') { neg = true; i++; }
+    long long intPart = 0; bool anyInt = false;
+    while (i < blen && b[i] >= '0' && b[i] <= '9') { intPart = intPart * 10 + (b[i] - '0'); anyInt = true; i++; }
+    if (!anyInt) return false;
+    uint8_t frac[16]; int fracN = 0;
+    if (i < blen && b[i] == '.') {
+      i++;
+      while (i < blen && b[i] >= '0' && b[i] <= '9') { if (fracN < 16) frac[fracN] = b[i] - '0'; fracN++; i++; }
+    }
+    long long v = intPart;
+    for (int s = 0; s < scale; s++) v = v * 10 + (s < fracN && s < 16 ? frac[s] : 0);
+    out = (int32_t)(neg ? -v : v);
+    return true;
+  }
+  bool bytesEqual(const uint8_t *b, int s, int e, const uint8_t *needle, int nlen) {
+    if (e - s != nlen) return false;
+    for (int t = 0; t < nlen; t++) if (b[s + t] != needle[t]) return false;
+    return true;
+  }
+  bool bytesContain(const uint8_t *b, int s, int e, const uint8_t *needle, int nlen) {
+    if (nlen == 0) return true;
+    if (e - s < nlen) return false;
+    for (int i = s; i <= e - nlen; i++) {
+      bool m = true;
+      for (int t = 0; t < nlen; t++) if (b[i + t] != needle[t]) { m = false; break; }
+      if (m) return true;
+    }
+    return false;
+  }
+
+  // 0x16: R[dst] = number at JSON <path> × 10^scale (truncated); R[found] = 0/1.
+  void doJsonNum(const uint8_t *p, int plen) {
     if (plen < 6) return;
+    int dst = p[1] & 0x0F, foundReg = p[2] & 0x0F, scale = p[3];
+    int pathLen = p[4] | (p[5] << 7);
+    if (6 + pathLen > plen) return;
+    const uint8_t *path = p + 6;
+    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
+    int blen = httpRespBody.length();
+    int s, e; int32_t v;
+    if (jsonValueSpan(b, blen, path, pathLen, s, e) && parseScaledNumber(b, blen, s, scale, v)) {
+      regs[dst] = v; regs[foundReg] = 1;
+    } else {
+      regs[dst] = 0; regs[foundReg] = 0;
+    }
+  }
+  // 0x17 (eq) / 0x19 (contains): compare JSON string at <path> with <str>.
+  void doJsonStr(const uint8_t *p, int plen, bool contains) {
+    if (plen < 4) return;
+    int dst = p[1] & 0x0F;
+    int pathLen = p[2] | (p[3] << 7);
+    int i = 4 + pathLen;
+    if (i + 2 > plen) return;
+    const uint8_t *path = p + 4;
+    int strLen = p[i] | (p[i + 1] << 7); i += 2;
+    if (i + strLen > plen) return;
+    const uint8_t *needle = p + i;
+    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
+    int blen = httpRespBody.length();
+    int32_t result = 0;
+    int s, e;
+    if (jsonValueSpan(b, blen, path, pathLen, s, e) && s < e && b[s] == '"') {
+      int cs = s + 1, ce = e - 1;                            // string content (escapes raw)
+      if (ce >= cs) {
+        result = (contains ? bytesContain(b, cs, ce, needle, strLen)
+                           : bytesEqual(b, cs, ce, needle, strLen)) ? 1 : 0;
+      }
+    }
+    regs[dst] = result;
+  }
+  // 0x18: R[dst] = whole body contains <str> ? 1 : 0.
+  void doBodyContains(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int dst = p[1] & 0x0F;
+    int strLen = p[2] | (p[3] << 7);
+    if (4 + strLen > plen) return;
+    const uint8_t *needle = p + 4;
+    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
+    int blen = httpRespBody.length();
+    regs[dst] = bytesContain(b, 0, blen, needle, strLen) ? 1 : 0;
+  }
+
+  // Internet action: a task (or live host) makes an HTTP(S) request over Wi-Fi.
+  // ext payload: 0x15 method statusReg urlLo urlHi url[] bodyLo bodyHi body[].
+  // method 0=GET 1=POST. Stores HTTP status in R[statusReg] (0 = Wi-Fi down/error)
+  // and retains the full response body for the inspection ops (JSON_NUM/*_STR_*/
+  // BODY_*). If a host is connected, status + body return as SCHED_EXT_HTTP_REPLY.
+  // https:// is validated against the IDF cert bundle (see README).
+  void doHttp(const uint8_t *p, int plen) {
+    if (plen < 5) return;
     uint8_t method   = p[1];
     int     statusReg = p[2] & 0x0F;
-    int     valueReg  = p[3] & 0x0F;
-    int     urlLen    = p[4] | (p[5] << 7);
-    int i = 6;
+    int     urlLen    = p[3] | (p[4] << 7);
+    int i = 5;
     if (urlLen <= 0 || i + urlLen > plen) return;
     String url; url.reserve(urlLen + 1);
     for (int k = 0; k < urlLen; k++) url += (char)p[i + k];
@@ -926,12 +1113,23 @@ class Scheduler {
     int status = 0;
 #if ENABLE_WIFI
     if (WiFi.status() == WL_CONNECTED) {
+      bool https = url.startsWith("https");
       HTTPClient http;
       http.setConnectTimeout(8000);
       http.setTimeout(8000);
       http.setReuse(false);
-      WiFiClient client;                       // plain HTTP only (see README)
-      if (http.begin(client, url)) {
+      http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+      WiFiClientSecure tls;
+      WiFiClient plain;
+      bool ok;
+      if (https) {
+        tls.setCACertBundle(fm_crt_bundle_start,
+                            (size_t)(fm_crt_bundle_end - fm_crt_bundle_start));  // validate certs
+        ok = http.begin(tls, url);
+      } else {
+        ok = http.begin(plain, url);
+      }
+      if (ok) {
         if (method == 1) {
           http.addHeader("Content-Type", "application/json");
           status = http.POST((uint8_t *)body.c_str(), body.length());
@@ -944,15 +1142,6 @@ class Scheduler {
     }
 #endif
     regs[statusReg] = status;
-
-    int rlen = httpRespBody.length();
-    if (rlen > 0) {
-      int m = rlen; if (m > HTTP_REPLY_MAX) m = HTTP_REPLY_MAX;
-      regs[valueReg] = parseFirstInt((const uint8_t *)httpRespBody.c_str(), m);
-    } else {
-      regs[valueReg] = 0;
-    }
-
     if (transportConnected()) sendHttpReply(status);
   }
 
@@ -986,6 +1175,18 @@ class Scheduler {
         break;
       case SCHED_EXT_HTTP:            // 0x15 internet request (see NONSTANDARD.md)
         doHttp(payload, plen);
+        break;
+      case SCHED_EXT_JSON_NUM:           // 0x16 dst found scale pathLo pathHi path…
+        doJsonNum(payload, plen);
+        break;
+      case SCHED_EXT_JSON_STR_EQ:        // 0x17 dst pathLo pathHi path… strLo strHi str…
+        doJsonStr(payload, plen, false);
+        break;
+      case SCHED_EXT_BODY_CONTAINS:      // 0x18 dst strLo strHi str…
+        doBodyContains(payload, plen);
+        break;
+      case SCHED_EXT_JSON_STR_CONTAINS:  // 0x19 dst pathLo pathHi path… strLo strHi str…
+        doJsonStr(payload, plen, true);
         break;
     }
   }
