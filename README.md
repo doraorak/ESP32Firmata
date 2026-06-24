@@ -12,6 +12,25 @@ Part of a three-repo Firmata-for-ESP32 suite — grab whichever piece you need:
 - **[ESP32FirmataSwift](https://github.com/doraorak/ESP32FirmataSwift)** — the Embedded-Swift firmware port (same wire protocol).
 - **[SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient)** — the macOS/iOS Swift client package.
 
+## Flash it
+
+**Arduino IDE:** open `ESP32Firmata.ino`, choose **ESP32 Dev Module** + **Partition Scheme → Huge APP (3 MB)**, pick your port, hit **Upload**.
+
+**One command** (same thing, from this folder in Terminal — needs [`arduino-cli`](https://arduino.github.io/arduino-cli/)):
+
+```bash
+./flash.sh      # auto-detects the port, builds + uploads
+./monitor.sh    # serial log — shows the board's Wi-Fi IP / Bonjour name
+```
+
+Pass a port explicitly with `./flash.sh /dev/cu.XXXX` if needed.
+
+Prefer not to build? A **prebuilt `.bin`** is attached to each
+[release](https://github.com/doraorak/ESP32Firmata/releases) — flash it with `esptool` or
+[ESP Web Tools](https://esp.huhn.me). Note it carries **placeholder Wi-Fi credentials**
+(so it won't join Wi-Fi out of the box — BLE still works); rebuild with your own
+SSID/password to use Wi-Fi.
+
 Self-contained — it implements the Firmata protocol directly, so the only
 dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,
 `Wire`). One sketch runs **both transports at once** — Wi-Fi/TCP + Bonjour **and**
