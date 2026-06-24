@@ -152,6 +152,28 @@ static const uint8_t SCHED_EXT_JSON_NUM         = 0x16;  // R[dst]=json number a
 static const uint8_t SCHED_EXT_JSON_STR_EQ      = 0x17;  // R[dst]=(json string at path == s)?1:0
 static const uint8_t SCHED_EXT_BODY_CONTAINS    = 0x18;  // R[dst]=body contains s?1:0
 static const uint8_t SCHED_EXT_JSON_STR_CONTAINS = 0x19; // R[dst]=(json string at path contains s)?1:0
+static const uint8_t SCHED_EXT_ARITH         = 0x1A;  // R[dst] = A <op> B (int; op 0+ 1- 2* 3/ 4%)
+static const uint8_t SCHED_EXT_SET_FLOAT     = 0x1B;  // F[dst] = float const (IEEE754 bits, 5 enc bytes)
+static const uint8_t SCHED_EXT_ARITH_FLOAT   = 0x1C;  // F[dst] = A <op> B (float; op 0+ 1- 2* 3/)
+static const uint8_t SCHED_EXT_JSON_FLOAT    = 0x1D;  // F[dst] = json float at path; R[found]
+static const uint8_t SCHED_EXT_JSON_TYPE     = 0x1E;  // R[dst] = json type at path (0..6)
+static const uint8_t SCHED_EXT_JSON_SIZE     = 0x1F;  // R[dst] = byte length of value span at path
+static const uint8_t SCHED_EXT_STR_LEN       = 0x20;  // R[dst] = content length of json string at path
+static const uint8_t SCHED_EXT_HEAP          = 0x21;  // R[freeReg]=free heap, R[largestReg]=largest block
+static const uint8_t SCHED_EXT_REQUEST_COUNT = 0x22;  // R[dst] = current request count (generation)
+static const uint8_t SCHED_EXT_SNAPSHOT      = 0x23;  // copy value at path from live body into a slot
+static const uint8_t SCHED_EXT_SELECT        = 0x24;  // pick inspection source (0=live, k=snapshot k-1)
+static const uint8_t SCHED_EXT_FREE          = 0x25;  // free a snapshot slot
+static const uint8_t SCHED_EXT_LAST_STATUS   = 0x26;  // R[dst] = status of last inspection op
+static const uint8_t SCHED_EXT_CMP           = 0x27;  // R[dst] = (A <op> B) ? 1 : 0
+
+// Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
+static const int32_t ST_OK            = 0;
+static const int32_t ST_NOT_FOUND     = 1;
+static const int32_t ST_STALE         = 2;
+static const int32_t ST_TYPE_MISMATCH = 3;
+static const int32_t ST_TOO_BIG       = 4;
+static const int32_t ST_ALLOC_FAILED  = 5;
 
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
@@ -268,6 +290,8 @@ static ContinuousRead contReads[MAX_CONT_READS];
 // (The Scheduler and FirmataProtocol classes, and their instances, are defined
 //  further down — after the send helpers they depend on.)
 static const uint8_t NUM_SCHED_REGS = 16;
+static const uint8_t NUM_FLOAT_REGS = 8;     // F0..F7 (logic extension)
+static const int     NUM_SNAP       = 2;     // response-body snapshot slots
 
 // Scratch buffer used to build outgoing frames.
 static uint8_t   frameBuf[2048];
@@ -722,8 +746,31 @@ class Scheduler {
   SchedTask        tasks[MAX_TASKS];
   SchedTask       *running = nullptr;
   int32_t          regs[NUM_SCHED_REGS];
+  float            fregs[NUM_FLOAT_REGS] = {0};   // F0..F7 (logic extension)
   FirmataProtocol *replay = nullptr;     // wired once at startup (see setup)
   String           httpRespBody;         // last HTTP response (until next request)
+
+  // Response-inspection state (snapshots + staleness, mirrors the Swift firmware).
+  int32_t  requestCount = 0;             // ++ on each HTTP request; basis for handle staleness
+  int      inspectSel   = 0;             // inspection source: 0 = live body, k = snapshot slot k-1
+  bool     inspectStale = false;         // borrowed live source selected after a newer request
+  int32_t  lastStatus   = ST_OK;         // result-status of the last inspection op
+  uint8_t *snapBuf[NUM_SNAP] = { nullptr, nullptr };   // owned snapshot copies
+  int      snapLen[NUM_SNAP] = { 0, 0 };
+
+  // An operand carries both an int and a float view; `isFloat` says which is
+  // authoritative (so a comparison/op promotes to float when either side is float).
+  struct Operand { bool isFloat; int32_t i; float f; };
+
+  // Trap-free Float -> Int32 (NaN -> 0, overflow clamps).
+  static int32_t f2i(float x) {
+    if (x != x) return 0;                          // NaN
+    if (x >=  2147483520.0f) return INT32_MAX;
+    if (x <= -2147483520.0f) return INT32_MIN;
+    return (int32_t)x;
+  }
+  // Reinterpret 32 raw bits as a Float (IEEE754) without aliasing UB.
+  static float bitsToFloat(uint32_t b) { union { uint32_t u; float f; } x; x.u = b; return x.f; }
 
   SchedTask *find(uint8_t id) {
     for (uint8_t i = 0; i < MAX_TASKS; i++)
@@ -762,6 +809,10 @@ class Scheduler {
   void reset() {
     for (uint8_t i = 0; i < MAX_TASKS; i++) tasks[i].used = false;
     for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) regs[i] = 0;
+    for (uint8_t i = 0; i < NUM_FLOAT_REGS; i++) fregs[i] = 0;
+    requestCount = 0;
+    inspectSel = 0; inspectStale = false; lastStatus = ST_OK;
+    for (int s = 0; s < NUM_SNAP; s++) { free(snapBuf[s]); snapBuf[s] = nullptr; snapLen[s] = 0; }
     running = nullptr;
   }
 
@@ -842,31 +893,50 @@ class Scheduler {
   }
 
   // ---- NON-STANDARD logic extension (see NONSTANDARD.md) ----
-  bool compare(uint8_t op, int32_t a, int32_t b) {
+  // Compare two operands; if either side is a float, promote the comparison to float.
+  bool compare(uint8_t op, const Operand &a, const Operand &b) {
+    if (a.isFloat || b.isFloat) {
+      float x = a.f, y = b.f;
+      switch (op) {
+        case 0: return x == y; case 1: return x != y; case 2: return x <  y;
+        case 3: return x >  y; case 4: return x <= y; case 5: return x >= y;
+        default: return false;
+      }
+    }
+    int32_t x = a.i, y = b.i;
     switch (op) {
-      case 0: return a == b;
-      case 1: return a != b;
-      case 2: return a <  b;
-      case 3: return a >  b;
-      case 4: return a <= b;
-      case 5: return a >= b;
+      case 0: return x == y; case 1: return x != y; case 2: return x <  y;
+      case 3: return x >  y; case 4: return x <= y; case 5: return x >= y;
       default: return false;
     }
   }
 
-  // Read one IF operand starting at payload[i]; advances i. Type byte: 0=register
-  // (1 byte index), 1=constant (5 Encoder7Bit bytes of an Int32).
-  int32_t readOperand(const uint8_t *payload, int plen, int &i) {
-    if (i >= plen) return 0;
+  // Read one operand starting at payload[i]; advances i. Type byte:
+  // 0 = int register, 1 = int const (5 enc bytes), 2 = float register,
+  // 3 = float const (IEEE754 bits, 5 enc bytes).
+  Operand readOperand(const uint8_t *payload, int plen, int &i) {
+    Operand o = { false, 0, 0.0f };
+    if (i >= plen) return o;
     uint8_t type = payload[i++];
-    if (type == 0) {                                   // register
-      if (i >= plen) return 0;
-      return regs[payload[i++] & 0x0F];
-    } else {                                           // constant
-      if (i + 5 > plen) { i = plen; return 0; }
-      int32_t v = (int32_t)sched7BitTime(payload + i);
-      i += 5;
-      return v;
+    switch (type) {
+      case 0: {                                        // int register
+        int32_t v = (i < plen) ? regs[payload[i] & 0x0F] : 0; i++;
+        return { false, v, (float)v };
+      }
+      case 2: {                                        // float register
+        float r = (i < plen) ? fregs[payload[i] & (NUM_FLOAT_REGS - 1)] : 0.0f; i++;
+        return { true, f2i(r), r };
+      }
+      case 3: {                                        // float constant
+        if (i + 5 > plen) { i = plen; return o; }
+        float fv = bitsToFloat(sched7BitTime(payload + i)); i += 5;
+        return { true, f2i(fv), fv };
+      }
+      default: {                                       // 1 = int constant
+        if (i + 5 > plen) { i = plen; return o; }
+        int32_t v = (int32_t)sched7BitTime(payload + i); i += 5;
+        return { false, v, (float)v };
+      }
     }
   }
 
@@ -1033,6 +1103,54 @@ class Scheduler {
     return false;
   }
 
+  // ====== Response inspection — pick the source, then walk it in place ======
+  // Source is the live body or a snapshot slot, chosen by SELECT. Returns the
+  // buffer + length and sets `stale` when a borrowed (live) source was selected
+  // against an out-of-date generation. Each op records a result-status (read with
+  // SCHED_EXT_LAST_STATUS).
+  const uint8_t *inspectBuf(int &blen, bool &stale) {
+    if (inspectSel == 0) {
+      blen = httpRespBody.length(); stale = inspectStale;
+      return (const uint8_t *)httpRespBody.c_str();
+    }
+    int s = inspectSel - 1; stale = false;
+    blen = (s >= 0 && s < NUM_SNAP) ? snapLen[s] : 0;
+    return (s >= 0 && s < NUM_SNAP) ? snapBuf[s] : nullptr;
+  }
+
+  // 10^e as Float by bounded repeated multiply (no libm dependency).
+  float pow10f(int e) {
+    float r = 1; int n = e;
+    if (n >= 0) { while (n > 0) { r *= 10; n--; } } else { while (n < 0) { r /= 10; n++; } }
+    return r;
+  }
+  // Parse a JSON number — or quoted "593.2", with optional exponent — into a Float.
+  bool parseFloat(const uint8_t *b, int blen, int i0, float &out) {
+    int i = jsonSkipWs(b, blen, i0);
+    if (i < blen && b[i] == '"') i++;                          // tolerate a quoted number
+    if (i >= blen) return false;
+    bool neg = false;
+    if (b[i] == '-') { neg = true; i++; }
+    float v = 0; bool anyInt = false;
+    while (i < blen && b[i] >= '0' && b[i] <= '9') { v = v * 10 + (b[i] - '0'); anyInt = true; i++; }
+    if (!anyInt) return false;
+    if (i < blen && b[i] == '.') {
+      i++; float scale = 1;
+      while (i < blen && b[i] >= '0' && b[i] <= '9') { v = v * 10 + (b[i] - '0'); scale *= 10; i++; }
+      v /= scale;
+    }
+    if (neg) v = -v;
+    if (i < blen && (b[i] == 'e' || b[i] == 'E')) {            // exponent
+      i++; bool eneg = false;
+      if (i < blen && (b[i] == '+' || b[i] == '-')) { eneg = (b[i] == '-'); i++; }
+      int e = 0;
+      while (i < blen && b[i] >= '0' && b[i] <= '9') { e = e * 10 + (b[i] - '0'); i++; }
+      v *= pow10f(eneg ? -e : e);
+    }
+    out = v;
+    return true;
+  }
+
   // 0x16: R[dst] = number at JSON <path> × 10^scale (truncated); R[found] = 0/1.
   void doJsonNum(const uint8_t *p, int plen) {
     if (plen < 6) return;
@@ -1040,14 +1158,14 @@ class Scheduler {
     int pathLen = p[4] | (p[5] << 7);
     if (6 + pathLen > plen) return;
     const uint8_t *path = p + 6;
-    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
-    int blen = httpRespBody.length();
+    regs[dst] = 0; regs[foundReg] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return; }
     int s, e; int32_t v;
-    if (jsonValueSpan(b, blen, path, pathLen, s, e) && parseScaledNumber(b, blen, s, scale, v)) {
-      regs[dst] = v; regs[foundReg] = 1;
-    } else {
-      regs[dst] = 0; regs[foundReg] = 0;
-    }
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e)) { lastStatus = ST_NOT_FOUND; return; }
+    if (!parseScaledNumber(b, blen, s, scale, v)) { lastStatus = ST_TYPE_MISMATCH; return; }
+    regs[dst] = v; regs[foundReg] = 1; lastStatus = ST_OK;
   }
   // 0x17 (eq) / 0x19 (contains): compare JSON string at <path> with <str>.
   void doJsonStr(const uint8_t *p, int plen, bool contains) {
@@ -1060,18 +1178,17 @@ class Scheduler {
     int strLen = p[i] | (p[i + 1] << 7); i += 2;
     if (i + strLen > plen) return;
     const uint8_t *needle = p + i;
-    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
-    int blen = httpRespBody.length();
-    int32_t result = 0;
+    regs[dst] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return; }
     int s, e;
-    if (jsonValueSpan(b, blen, path, pathLen, s, e) && s < e && b[s] == '"') {
-      int cs = s + 1, ce = e - 1;                            // string content (escapes raw)
-      if (ce >= cs) {
-        result = (contains ? bytesContain(b, cs, ce, needle, strLen)
-                           : bytesEqual(b, cs, ce, needle, strLen)) ? 1 : 0;
-      }
-    }
-    regs[dst] = result;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e)) { lastStatus = ST_NOT_FOUND; return; }
+    if (!(s < e && b[s] == '"')) { lastStatus = ST_TYPE_MISMATCH; return; }
+    int cs = s + 1, ce = e - 1;                              // string content (escapes raw)
+    if (ce >= cs) regs[dst] = (contains ? bytesContain(b, cs, ce, needle, strLen)
+                                        : bytesEqual(b, cs, ce, needle, strLen)) ? 1 : 0;
+    lastStatus = ST_OK;
   }
   // 0x18: R[dst] = whole body contains <str> ? 1 : 0.
   void doBodyContains(const uint8_t *p, int plen) {
@@ -1080,9 +1197,171 @@ class Scheduler {
     int strLen = p[2] | (p[3] << 7);
     if (4 + strLen > plen) return;
     const uint8_t *needle = p + 4;
+    regs[dst] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return; }
+    regs[dst] = bytesContain(b, 0, blen, needle, strLen) ? 1 : 0; lastStatus = ST_OK;
+  }
+  // 0x1D: F[dst] = json float at <path>; R[found] = 0/1.
+  void doJsonFloat(const uint8_t *p, int plen) {
+    if (plen < 5) return;
+    int dst = p[1] & (NUM_FLOAT_REGS - 1), foundReg = p[2] & 0x0F;
+    int pathLen = p[3] | (p[4] << 7);
+    if (5 + pathLen > plen) return;
+    const uint8_t *path = p + 5;
+    fregs[dst] = 0; regs[foundReg] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return; }
+    int s, e; float v;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e)) { lastStatus = ST_NOT_FOUND; return; }
+    if (!parseFloat(b, blen, s, v)) { lastStatus = ST_TYPE_MISMATCH; return; }
+    fregs[dst] = v; regs[foundReg] = 1; lastStatus = ST_OK;
+  }
+  // Shared setup for the query ops (JSON_TYPE/SIZE/STR_LEN): resolves dst + source.
+  bool queryArgs(const uint8_t *p, int plen, int &dst,
+                 const uint8_t *&b, int &blen, const uint8_t *&path, int &pathLen) {
+    if (plen < 4) return false;
+    dst = p[1] & 0x0F;
+    pathLen = p[2] | (p[3] << 7);
+    if (4 + pathLen > plen) return false;
+    path = p + 4;
+    regs[dst] = 0;
+    bool stale; b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return false; }
+    if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return false; }
+    return true;
+  }
+  // 0x1E: R[dst] = JSON type at path (0 none,1 obj,2 arr,3 str,4 num,5 bool,6 null).
+  void doJsonType(const uint8_t *p, int plen) {
+    int dst, blen, pathLen; const uint8_t *b, *path;
+    if (!queryArgs(p, plen, dst, b, blen, path, pathLen)) return;
+    int s, e;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e) || !(s < e)) { lastStatus = ST_NOT_FOUND; return; }
+    uint8_t c = b[s]; int32_t t = 0;
+    if (c == '{') t = 1;
+    else if (c == '[') t = 2;
+    else if (c == '"') t = 3;
+    else if ((c >= '0' && c <= '9') || c == '-') t = 4;
+    else if (c == 't' || c == 'f') t = 5;
+    else if (c == 'n') t = 6;
+    regs[dst] = t; lastStatus = ST_OK;
+  }
+  // 0x1F: R[dst] = byte length of the value span at path (for sizing a snapshot).
+  void doJsonSize(const uint8_t *p, int plen) {
+    int dst, blen, pathLen; const uint8_t *b, *path;
+    if (!queryArgs(p, plen, dst, b, blen, path, pathLen)) return;
+    int s, e;
+    if (jsonValueSpan(b, blen, path, pathLen, s, e)) { regs[dst] = (int32_t)(e - s); lastStatus = ST_OK; }
+    else { regs[dst] = 0; lastStatus = ST_NOT_FOUND; }
+  }
+  // 0x20: R[dst] = content length of the JSON string at path (0 if not a string).
+  void doStrLen(const uint8_t *p, int plen) {
+    int dst, blen, pathLen; const uint8_t *b, *path;
+    if (!queryArgs(p, plen, dst, b, blen, path, pathLen)) return;
+    int s, e;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e)) { regs[dst] = 0; lastStatus = ST_NOT_FOUND; return; }
+    if (e - s >= 2 && b[s] == '"') { regs[dst] = (int32_t)(e - s - 2); lastStatus = ST_OK; }
+    else { regs[dst] = 0; lastStatus = ST_TYPE_MISMATCH; }
+  }
+  // 0x1A: R[dst] = A <op> B (int; op 0+ 1- 2* 3/ 4%). 64-bit intermediates; ÷/%0 -> 0.
+  void doArith(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    uint8_t sub = p[1]; int dst = p[2] & 0x0F;
+    int i = 3;
+    int32_t a = readOperand(p, plen, i).i;
+    int32_t b = readOperand(p, plen, i).i;
+    int32_t r = 0;
+    switch (sub) {
+      case 0: r = a + b; break;
+      case 1: r = a - b; break;
+      case 2: r = (int32_t)((int64_t)a * (int64_t)b); break;
+      case 3: r = (b != 0) ? (int32_t)((int64_t)a / (int64_t)b) : 0; break;
+      case 4: r = (b != 0) ? (int32_t)((int64_t)a % (int64_t)b) : 0; break;
+      default: r = 0;
+    }
+    regs[dst] = r;
+  }
+  // 0x1C: F[dst] = A <op> B (float; op 0+ 1- 2* 3/). ÷0 -> 0.
+  void doArithFloat(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    uint8_t sub = p[1]; int dst = p[2] & (NUM_FLOAT_REGS - 1);
+    int i = 3;
+    float a = readOperand(p, plen, i).f;
+    float b = readOperand(p, plen, i).f;
+    float r = 0;
+    switch (sub) {
+      case 0: r = a + b; break;
+      case 1: r = a - b; break;
+      case 2: r = a * b; break;
+      case 3: r = (b != 0) ? a / b : 0; break;
+      default: r = 0;
+    }
+    fregs[dst] = r;
+  }
+  // 0x1B: F[dst] = float constant (IEEE754 bits in 5 Encoder7Bit bytes).
+  void doSetFloat(const uint8_t *p, int plen) {
+    if (plen != 7) return;
+    fregs[p[1] & (NUM_FLOAT_REGS - 1)] = bitsToFloat(sched7BitTime(p + 2));
+  }
+  // 0x27: R[dst] = (A <op> B) ? 1 : 0 (same operand decoding + float promotion as IF).
+  void doCmp(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    uint8_t op = p[1]; int dst = p[2] & 0x0F;
+    int i = 3;
+    Operand a = readOperand(p, plen, i);
+    Operand b = readOperand(p, plen, i);
+    regs[dst] = compare(op, a, b) ? 1 : 0;
+  }
+  // 0x22: R[dst] = current request count (generation; ++ per HTTP request).
+  void doReadRequestCount(const uint8_t *p, int plen) {
+    if (plen < 2) return;
+    regs[p[1] & 0x0F] = requestCount;
+  }
+  // 0x21: R[freeReg] = free heap, R[largestReg] = largest free block.
+  void doHeap(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    regs[p[1] & 0x0F] = (int32_t)ESP.getFreeHeap();
+    regs[p[2] & 0x0F] = (int32_t)ESP.getMaxAllocHeap();
+  }
+  // 0x26: R[dst] = status of the last inspection op.
+  void doLastStatus(const uint8_t *p, int plen) {
+    if (plen < 2) return;
+    regs[p[1] & 0x0F] = lastStatus;
+  }
+  // 0x24: select inspection source — 0 = live body (stale if requestCount != R[expGenReg]),
+  //       k = snapshot slot k-1 (always valid).
+  void doSelect(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    inspectSel = p[1];
+    inspectStale = (inspectSel == 0) ? (requestCount != regs[p[2] & 0x0F]) : false;
+  }
+  // 0x25: free snapshot slot <slot>.
+  void doFree(const uint8_t *p, int plen) {
+    if (plen < 2) return;
+    int slot = p[1];
+    if (slot >= 0 && slot < NUM_SNAP) { free(snapBuf[slot]); snapBuf[slot] = nullptr; snapLen[slot] = 0; }
+  }
+  // 0x23: copy the value at <path> from the LIVE body into snapshot slot <slot>
+  //       (pathLen 0 = whole body). Grow-only realloc keeps the copy until freed.
+  void doSnapshot(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int slot = p[1]; if (slot < 0 || slot >= NUM_SNAP) return;
+    int pathLen = p[2] | (p[3] << 7);
+    if (4 + pathLen > plen) return;
+    const uint8_t *path = p + 4;
     const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
     int blen = httpRespBody.length();
-    regs[dst] = bytesContain(b, 0, blen, needle, strLen) ? 1 : 0;
+    if (blen <= 0) { lastStatus = ST_NOT_FOUND; return; }
+    int s, e;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e) || e <= s) { lastStatus = ST_NOT_FOUND; return; }
+    int n = e - s;
+    uint8_t *nb = (uint8_t *)realloc(snapBuf[slot], n);
+    if (!nb) { lastStatus = ST_ALLOC_FAILED; return; }
+    memcpy(nb, b + s, n);
+    snapBuf[slot] = nb; snapLen[slot] = n;
+    lastStatus = ST_OK;
   }
 
   // Internet action: a task (or live host) makes an HTTP(S) request over Wi-Fi.
@@ -1140,6 +1419,7 @@ class Scheduler {
     }
 #endif
     regs[statusReg] = status;
+    requestCount++;                       // the retained body just changed (handle-staleness basis)
     if (transportConnected()) sendHttpReply(status);
   }
 
@@ -1161,8 +1441,8 @@ class Scheduler {
       case SCHED_EXT_IF: {              // 0x13 op <operandA> <operandB> skipLo skipHi
         int i = 1;
         uint8_t op = payload[i++];
-        int32_t a = readOperand(payload, plen, i);
-        int32_t b = readOperand(payload, plen, i);
+        Operand a = readOperand(payload, plen, i);
+        Operand b = readOperand(payload, plen, i);
         if (i + 2 > plen) break;
         uint16_t amount = (uint16_t)(payload[i] | (payload[i + 1] << 7));
         if (!compare(op, a, b)) skip(amount);   // condition false -> skip block
@@ -1185,6 +1465,48 @@ class Scheduler {
         break;
       case SCHED_EXT_JSON_STR_CONTAINS:  // 0x19 dst pathLo pathHi path… strLo strHi str…
         doJsonStr(payload, plen, true);
+        break;
+      case SCHED_EXT_ARITH:              // 0x1A subop dst <operandA> <operandB>
+        doArith(payload, plen);
+        break;
+      case SCHED_EXT_SET_FLOAT:          // 0x1B fdst <const:5>
+        doSetFloat(payload, plen);
+        break;
+      case SCHED_EXT_ARITH_FLOAT:        // 0x1C subop fdst <operandA> <operandB>
+        doArithFloat(payload, plen);
+        break;
+      case SCHED_EXT_JSON_FLOAT:         // 0x1D fdst found pathLo pathHi path…
+        doJsonFloat(payload, plen);
+        break;
+      case SCHED_EXT_JSON_TYPE:          // 0x1E dst pathLo pathHi path…
+        doJsonType(payload, plen);
+        break;
+      case SCHED_EXT_JSON_SIZE:          // 0x1F dst pathLo pathHi path…
+        doJsonSize(payload, plen);
+        break;
+      case SCHED_EXT_STR_LEN:            // 0x20 dst pathLo pathHi path…
+        doStrLen(payload, plen);
+        break;
+      case SCHED_EXT_HEAP:               // 0x21 freeReg largestReg
+        doHeap(payload, plen);
+        break;
+      case SCHED_EXT_REQUEST_COUNT:      // 0x22 dst
+        doReadRequestCount(payload, plen);
+        break;
+      case SCHED_EXT_SNAPSHOT:           // 0x23 slot pathLo pathHi path…
+        doSnapshot(payload, plen);
+        break;
+      case SCHED_EXT_SELECT:             // 0x24 sel expGenReg
+        doSelect(payload, plen);
+        break;
+      case SCHED_EXT_FREE:               // 0x25 slot
+        doFree(payload, plen);
+        break;
+      case SCHED_EXT_LAST_STATUS:        // 0x26 dst
+        doLastStatus(payload, plen);
+        break;
+      case SCHED_EXT_CMP:                // 0x27 op dst <operandA> <operandB>
+        doCmp(payload, plen);
         break;
     }
   }

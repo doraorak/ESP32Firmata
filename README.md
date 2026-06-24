@@ -4,6 +4,14 @@ Firmata 2.x firmware for the **original ESP32** (ESP32-WROOM-32 / -WROVER),
 byte-for-byte compatible with the
 [**SwiftFirmataClient**](https://github.com/doraorak/SwiftFirmataClient) package.
 
+## The project suite
+
+Part of a three-repo Firmata-for-ESP32 suite — grab whichever piece you need:
+
+- **[ESP32Firmata](https://github.com/doraorak/ESP32Firmata)** — the C++/Arduino ESP32 firmware *(this repo)*.
+- **[ESP32FirmataSwift](https://github.com/doraorak/ESP32FirmataSwift)** — the Embedded-Swift firmware port (same wire protocol).
+- **[SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient)** — the macOS/iOS Swift client package.
+
 Self-contained — it implements the Firmata protocol directly, so the only
 dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,
 `Wire`). One sketch runs **both transports at once** — Wi-Fi/TCP + Bonjour **and**
@@ -141,22 +149,49 @@ JSON_NUM       F0 7B 7F 16 <dst> <found> <scale> <pathLen:2> <path…>     F7
 JSON_STR_EQ    F0 7B 7F 17 <dst> <pathLen:2> <path…> <strLen:2> <str…>   F7
 BODY_CONTAINS  F0 7B 7F 18 <dst> <strLen:2> <str…>                       F7
 JSON_STR_CONT  F0 7B 7F 19 <dst> <pathLen:2> <path…> <strLen:2> <str…>   F7
+ARITH          F0 7B 7F 1A <subop> <dst> <operandA> <operandB>          F7  // R[dst] = A op B (int)
+SET_FLOAT      F0 7B 7F 1B <fdst> <const:5>                             F7  // F[fdst] = float
+ARITH_F        F0 7B 7F 1C <subop> <fdst> <operandA> <operandB>         F7  // F[fdst] = A op B (float)
+JSON_FLOAT     F0 7B 7F 1D <fdst> <found> <pathLen:2> <path…>           F7  // F[fdst] = json float
+JSON_TYPE      F0 7B 7F 1E <dst> <pathLen:2> <path…>                    F7  // R[dst] = type at path
+JSON_SIZE      F0 7B 7F 1F <dst> <pathLen:2> <path…>                    F7  // R[dst] = span byte length
+STR_LEN        F0 7B 7F 20 <dst> <pathLen:2> <path…>                    F7  // R[dst] = string content length
+HEAP           F0 7B 7F 21 <freeReg> <largestReg>                       F7  // R = free heap / largest block
+REQUEST_COUNT  F0 7B 7F 22 <dst>                                        F7  // R[dst] = request generation
+SNAPSHOT       F0 7B 7F 23 <slot> <pathLen:2> <path…>                   F7  // copy value -> snapshot slot
+SELECT         F0 7B 7F 24 <sel> <expGenReg>                            F7  // 0=live(gen-checked), k=snap k-1
+FREE           F0 7B 7F 25 <slot>                                       F7  // free a snapshot slot
+LAST_STATUS    F0 7B 7F 26 <dst>                                        F7  // R[dst] = last inspection status
+CMP            F0 7B 7F 27 <op> <dst> <operandA> <operandB>             F7  // R[dst] = (A op B) ? 1 : 0
 HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  // device -> host
 ```
 
-* `<reg>`: register index, low nibble (`0`–`15`).
-* `<op>`: `0 ==`, `1 !=`, `2 <`, `3 >`, `4 <=`, `5 >=`.
-* `<operand>`: a type byte then data — `00 <reg>` (register) or `01 <const:5>` (literal).
+* `<reg>`: int register index, low nibble (`0`–`15`). `<fdst>`: float register (`0`–`7`).
+* `<op>`: `0 ==`, `1 !=`, `2 <`, `3 >`, `4 <=`, `5 >=`. `<subop>`: `0 +`, `1 −`, `2 ×`, `3 ÷`, `4 %`.
+* `<operand>`: a type byte then data — `00 <reg>` (int register), `01 <const:5>` (int
+  literal), `02 <freg>` (float register), or `03 <const:5>` (float literal, IEEE754 bits).
+  `IF`/`ARITH`/`ARITH_F`/`CMP` accept any type; if either side is float the device promotes.
 * `<pin>`: GPIO number. `<channel>`: analog channel index (A0 = 0…), **not a pin**.
 * `HTTP` (`0x15`): `<method>` `0`=GET `1`=POST. Makes the HTTP(S) request over Wi-Fi,
-  sets `R[statusReg]` = HTTP status (`0` on failure), and retains the body for the
-  inspection ops. POST sends `Content-Type: application/json`.
+  sets `R[statusReg]` = HTTP status (`0` on failure), retains the body for the
+  inspection ops, and bumps the request generation (`REQUEST_COUNT`). POST sends
+  `Content-Type: application/json`.
 * `JSON_NUM` (`0x16`): `R[dst]` = number at `<path>` × 10^`<scale>` (truncated),
   `R[found]` = `1`/`0`. `<path>` is dotted/indexed, e.g. `result[0].changePercent`.
   `JSON_STR_EQ`/`JSON_STR_CONT` (`0x17`/`0x19`): `R[dst]` = `1`/`0` from comparing the
   JSON string at `<path>`. `BODY_CONTAINS` (`0x18`): `R[dst]` = `1`/`0` substring over
-  the whole body. `HTTP_REPLY` carries status (`lo hi`) + body (14-bit pairs, up to
-  ~4 KB) back to a connected host.
+  the whole body. `JSON_FLOAT` (`0x1D`) reads a JSON number (quoted/fractional/exponent)
+  into `F[fdst]`. `JSON_TYPE` (`0x1E`) → `0` none, `1` obj, `2` arr, `3` str, `4` num,
+  `5` bool, `6` null. `JSON_SIZE` (`0x1F`) → span byte length; `STR_LEN` (`0x20`) → string
+  content length; `HEAP` (`0x21`) → free heap + largest block.
+* Handles: `REQUEST_COUNT` (`0x22`) reads the generation (++ per request). `SNAPSHOT`
+  (`0x23`) copies a value into one of 2 grow-only slots that outlive the next request
+  (`<pathLen>` 0 = whole body). `SELECT` (`0x24`) picks the inspection source: `0` = live
+  (marked **stale** if `requestCount != R[expGenReg]`), `k` = snapshot slot `k-1`. `FREE`
+  (`0x25`) releases a slot. `LAST_STATUS` (`0x26`) → the last inspection op's status
+  (`0` ok, `1` notFound, `2` stale, `3` typeMismatch, `4` tooBig, `5` allocFailed). `CMP`
+  (`0x27`) materialises `(A op B) ? 1 : 0` into a register (same operands/promotion as `IF`).
+  `HTTP_REPLY` carries status (`lo hi`) + body (14-bit pairs, up to ~4 KB) back to a host.
 
 `if`/`else` is laid out so the byte counts line up:
 `[IF skip=thenLen] [then bytes] [SKIP skip=elseLen] [else bytes]` — a false `IF`
@@ -176,3 +211,9 @@ are unchanged from standard Firmata.
   **`https://` (cert-validated)** GET both return 200 + body — e.g. example.com
   (559 B) and api JSON (83 B). The JSON/string inspection ops mirror the
   (hardware-verified) ESP32FirmataSwift implementation.
+* Full logic-extension parity with ESP32FirmataSwift — ops `0x10`–`0x27`, including
+  integer + float operands, float-promoting `IF`/`CMP`, `ARITH`/`ARITH_F`,
+  `JSON_FLOAT`/`JSON_TYPE`/`JSON_SIZE`/`STR_LEN`, `HEAP`, and the snapshot/select/
+  staleness model (`SNAPSHOT`/`SELECT`/`FREE`/`REQUEST_COUNT`/`LAST_STATUS`).
+  Hardware-verified on the board: `CMP` (true/false/float-promoted), `ARITH`, and
+  `isValid()` (fresh + stale) all pass end-to-end via pin-state read-back.
