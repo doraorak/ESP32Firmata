@@ -27,9 +27,31 @@ Pass a port explicitly with `./flash.sh /dev/cu.XXXX` if needed.
 
 Prefer not to build? A **prebuilt `.bin`** is attached to each
 [release](https://github.com/doraorak/ESP32Firmata/releases) — flash it with `esptool` or
-[ESP Web Tools](https://esp.huhn.me). Note it carries **placeholder Wi-Fi credentials**
-(so it won't join Wi-Fi out of the box — BLE still works); rebuild with your own
-SSID/password to use Wi-Fi.
+[ESP Web Tools](https://esp.huhn.me), then hand it your Wi-Fi over BLE (see below — no
+rebuild needed).
+
+## Wi-Fi credentials — two ways
+
+**A · Compile-time (works out of the box).** Set `WIFI_SSID` / `WIFI_PASS` at the top of
+`ESP32Firmata.ino` before flashing; the board joins your network on boot. Simplest when you
+build it yourself.
+
+**B · Provision over BLE (no rebuild — ideal for the prebuilt `.bin`).** Leave the
+placeholders, flash, then send credentials from the client over BLE:
+
+```swift
+let client = FirmataClient(transport: BLETransport())   // Wi-Fi is down, so use BLE
+await client.connect()
+let status = try await client.provisionWiFi(ssid: "MyNetwork", password: "hunter2")
+print(status.connected, status.ip ?? "—")               // e.g. true 192.168.1.50
+```
+
+The handshake is **encrypted** — an ephemeral X25519 ECDH → HKDF-SHA256 → AES-256-GCM, so
+a passive sniffer never sees the password (no BLE pairing required). Provisioned creds are
+saved on the device (NVS) and **override** the compile-time defaults on every boot; clear
+them with `client.forgetWiFi()`. (No pairing means it's not hardened against an active
+real-time MITM during the handshake — fine for the typical "set it up on your own bench"
+case.)
 
 Self-contained — it implements the Firmata protocol directly, so the only
 dependencies are the ESP32 Arduino core libraries (`WiFi`, `ESPmDNS`, `BLE*`,

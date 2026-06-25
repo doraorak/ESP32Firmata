@@ -86,6 +86,15 @@
   // The arduino-esp32 core embeds it (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE).
   extern const uint8_t fm_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
   extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
+  #include <Preferences.h>          // NVS — persist BLE-provisioned Wi-Fi creds
+  #include <esp_random.h>           // hardware RNG for the provisioning handshake
+  #include <mbedtls/ecdh.h>         // X25519 ECDH ─┐ encrypted Wi-Fi provisioning
+  #include <mbedtls/ecp.h>          //              │ (see WIFI_CONFIG below)
+  #include <mbedtls/bignum.h>       //              │
+  #include <mbedtls/gcm.h>          // AES-256-GCM ─┤
+  #include <mbedtls/hkdf.h>         // HKDF-SHA256 ─┘
+  #include <mbedtls/md.h>
+  #include <mbedtls/platform_util.h>  // mbedtls_platform_zeroize
 #endif
 #if ENABLE_BLE
   #include <NimBLEDevice.h>   // NimBLE uses far less heap than Bluedroid — leaves
@@ -174,6 +183,21 @@ static const int32_t ST_STALE         = 2;
 static const int32_t ST_TYPE_MISMATCH = 3;
 static const int32_t ST_TOO_BIG       = 4;
 static const int32_t ST_ALLOC_FAILED  = 5;
+
+// --- Encrypted Wi-Fi provisioning over any transport (non-standard) ----------
+// Top-level SysEx in Firmata's reserved user range (0x00-0x0F). Lets a client
+// hand the board its Wi-Fi credentials — typically over BLE before Wi-Fi is up —
+// via an ephemeral X25519 ECDH handshake (HKDF-SHA256 -> AES-256-GCM), so a
+// passive sniffer never sees the password. Provisioned creds persist in NVS and
+// override the compile-time WIFI_SSID/WIFI_PASS on the next boot.
+static const uint8_t WIFI_CONFIG = 0x0C;
+static const uint8_t WC_SET    = 0x00;  // host->dev: <clientPub><nonce><ct+tag>  (set + connect + save)
+static const uint8_t WC_FORGET = 0x01;  // host->dev: clear stored creds
+static const uint8_t WC_QUERY  = 0x02;  // host->dev: request current status
+static const uint8_t WC_BEGIN  = 0x03;  // host->dev: start handshake (get device pubkey)
+static const uint8_t WC_KEY    = 0x7E;  // dev->host: <devicePub>  (32 bytes, ephemeral)
+static const uint8_t WC_STATUS = 0x7F;  // dev->host: <code> <ipLen> <ip>  (code 0=down 1=connected 2=rejected)
+// Binary fields above are sent as 14-bit LSB/MSB pairs (lo = b&0x7F, hi = b>>7).
 
 // Pin modes (Firmata §2)
 static const uint8_t PIN_MODE_INPUT  = 0x00;
@@ -1575,6 +1599,10 @@ class Scheduler {
 };
 
 // Now that Scheduler is complete, define the handler's scheduler-dispatching SysEx.
+#if ENABLE_WIFI
+static void handleWiFiConfig(const uint8_t *data, int dlen);   // defined in the Wi-Fi section
+#endif
+
 void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
   if (len < 1) return;
   uint8_t cmd = buf[0];
@@ -1582,6 +1610,9 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
   int dlen = len - 1;
 
   switch (cmd) {
+#if ENABLE_WIFI
+    case WIFI_CONFIG:           handleWiFiConfig(data, dlen);  break;
+#endif
     case REPORT_FIRMWARE:       sendFirmwareReport();        break;
     case CAPABILITY_QUERY:      sendCapabilityResponse();    break;
     case ANALOG_MAPPING_QUERY:  sendAnalogMappingResponse(); break;
@@ -1727,13 +1758,194 @@ static void startTcpServices() {
   Serial.println(WiFi.localIP());
 }
 
-static void tcpInit() {
+// ===========================================================================
+//   Encrypted Wi-Fi provisioning  (WIFI_CONFIG SysEx — see the constants above)
+//
+//   Active creds = NVS-provisioned (if any) else the compile-time WIFI_SSID/PASS.
+//   A client hands over new creds via an ephemeral X25519 ECDH handshake
+//   (HKDF-SHA256 -> AES-256-GCM), typically over BLE while Wi-Fi is down.
+// ===========================================================================
+static Preferences wcPrefs;
+static String      g_ssid, g_pass;
+static bool        g_credsLoaded = false;
+
+static void wcLoadCreds() {
+  if (g_credsLoaded) return;
+  wcPrefs.begin("wifiprov", true);                  // read-only
+  g_ssid = wcPrefs.getString("ssid", WIFI_SSID);    // fall back to compile-time
+  g_pass = wcPrefs.getString("pass", WIFI_PASS);
+  wcPrefs.end();
+  g_credsLoaded = true;
+}
+
+// (Re)connect Wi-Fi with the active creds; restart Bonjour/TCP on success.
+static bool wcConnect() {
+  // Already on the target network? Don't tear down a working link (this also lets
+  // a re-provision over TCP send its reply before the socket would drop).
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == g_ssid && WiFi.psk() == g_pass) {
+    if (!wifiReady) startTcpServices();
+    return true;
+  }
+  WiFi.disconnect(false, true);
+  wifiReady = false;
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(MDNS_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
+  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+  uint8_t tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) { delay(400); tries++; }   // ~12 s
+  if (WiFi.status() == WL_CONNECTED) { startTcpServices(); return true; }
+  return false;
+}
+
+static bool wcApplyCreds(const String &ssid, const String &pass) {
+  g_ssid = ssid; g_pass = pass;
+  wcPrefs.begin("wifiprov", false);
+  wcPrefs.putString("ssid", ssid);
+  wcPrefs.putString("pass", pass);
+  wcPrefs.end();
+  return wcConnect();
+}
+
+static void wcForget() {
+  wcPrefs.begin("wifiprov", false); wcPrefs.clear(); wcPrefs.end();
+  g_ssid = WIFI_SSID; g_pass = WIFI_PASS;
+}
+
+// ---- Crypto: ephemeral X25519 ECDH -> HKDF-SHA256 -> AES-256-GCM ------------
+static const char WC_HKDF_SALT[] = "firmata-wifi-prov-v1";   // must match the client
+
+static int wcRng(void *, unsigned char *out, size_t len) { esp_fill_random(out, len); return 0; }
+
+static mbedtls_ecp_group wcGrp;
+static mbedtls_mpi       wcPriv;
+static bool wcGrpInit = false, wcHavePriv = false;
+
+// Start a handshake: fresh ephemeral keypair; output our 32-byte public key.
+static bool wcBegin(uint8_t outPub[32]) {
+  if (!wcGrpInit) {
+    mbedtls_ecp_group_init(&wcGrp);
+    if (mbedtls_ecp_group_load(&wcGrp, MBEDTLS_ECP_DP_CURVE25519) != 0) return false;
+    wcGrpInit = true;
+  }
+  if (wcHavePriv) { mbedtls_mpi_free(&wcPriv); wcHavePriv = false; }
+  mbedtls_mpi_init(&wcPriv);
+  mbedtls_ecp_point Q; mbedtls_ecp_point_init(&Q);
+  int rc = mbedtls_ecdh_gen_public(&wcGrp, &wcPriv, &Q, wcRng, nullptr);
+  if (rc == 0) rc = mbedtls_mpi_write_binary_le(&Q.MBEDTLS_PRIVATE(X), outPub, 32);   // X25519 u (LE)
+  mbedtls_ecp_point_free(&Q);
+  if (rc == 0) { wcHavePriv = true; return true; }
+  mbedtls_mpi_free(&wcPriv);
+  return false;
+}
+
+// Finish: ECDH with the peer pubkey, HKDF -> 32-byte AES key. One-shot.
+static bool wcDeriveKey(const uint8_t peerPub[32], uint8_t outKey[32]) {
+  if (!wcHavePriv) return false;
+  mbedtls_ecp_point Qp; mbedtls_ecp_point_init(&Qp);
+  mbedtls_mpi z; mbedtls_mpi_init(&z);
+  uint8_t secret[32]; bool ok = false;
+  if (mbedtls_mpi_read_binary_le(&Qp.MBEDTLS_PRIVATE(X), peerPub, 32) == 0 &&
+      mbedtls_mpi_lset(&Qp.MBEDTLS_PRIVATE(Z), 1) == 0 &&
+      mbedtls_ecdh_compute_shared(&wcGrp, &z, &Qp, &wcPriv, wcRng, nullptr) == 0 &&
+      mbedtls_mpi_write_binary_le(&z, secret, 32) == 0) {
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md && mbedtls_hkdf(md, (const uint8_t *)WC_HKDF_SALT, sizeof(WC_HKDF_SALT) - 1,
+                           secret, 32, nullptr, 0, outKey, 32) == 0) ok = true;
+  }
+  mbedtls_platform_zeroize(secret, sizeof(secret));
+  mbedtls_mpi_free(&z); mbedtls_ecp_point_free(&Qp);
+  mbedtls_mpi_free(&wcPriv); wcHavePriv = false;            // ephemeral: single use
+  return ok;
+}
+
+static bool wcGcmDecrypt(const uint8_t key[32], const uint8_t nonce[12],
+                         const uint8_t *ct, size_t ctLen,
+                         const uint8_t *tag, uint8_t *outPt) {
+  mbedtls_gcm_context g; mbedtls_gcm_init(&g);
+  bool ok = (mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256) == 0 &&
+             mbedtls_gcm_auth_decrypt(&g, ctLen, nonce, 12, nullptr, 0,
+                                      tag, 16, ct, outPt) == 0);
+  mbedtls_gcm_free(&g);
+  return ok;
+}
+
+// ---- Wire helpers: binary <-> 14-bit LSB/MSB pairs (SysEx-safe) -------------
+static int wcDecodePairs(const uint8_t *in, int inLen, uint8_t *out, int outCap) {
+  int n = inLen / 2; if (n > outCap) n = outCap;
+  for (int i = 0; i < n; i++) out[i] = (in[2*i] & 0x7F) | ((in[2*i+1] & 0x01) << 7);
+  return n;
+}
+static int wcPutPairs(uint8_t *out, int n, const uint8_t *src, int len) {
+  for (int i = 0; i < len; i++) { out[n++] = src[i] & 0x7F; out[n++] = (src[i] >> 7) & 0x01; }
+  return n;
+}
+
+static void wcSendKey(const uint8_t pub[32]) {
+  uint8_t out[3 + 64 + 1]; int n = 0;
+  out[n++] = START_SYSEX; out[n++] = WIFI_CONFIG; out[n++] = WC_KEY;
+  n = wcPutPairs(out, n, pub, 32);
+  out[n++] = END_SYSEX;
+  sendFrame(out, n);
+}
+// code: 0 = Wi-Fi down, 1 = connected, 2 = creds rejected (decrypt/auth failed).
+static void wcSendStatusCode(uint8_t code) {
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
+  int il = ip.length(); if (il > 32) il = 32;
+  uint8_t out[3 + 1 + 1 + 64 + 1]; int n = 0;
+  out[n++] = START_SYSEX; out[n++] = WIFI_CONFIG; out[n++] = WC_STATUS;
+  out[n++] = code;
+  out[n++] = il & 0x7F;
+  n = wcPutPairs(out, n, (const uint8_t *)ip.c_str(), il);
+  out[n++] = END_SYSEX;
+  sendFrame(out, n);
+}
+static void wcSendStatus() { wcSendStatusCode(WiFi.status() == WL_CONNECTED ? 1 : 0); }
+
+static void handleWiFiConfig(const uint8_t *data, int dlen) {
+  if (dlen < 1) return;
+  switch (data[0]) {
+    case WC_BEGIN: { uint8_t pub[32]; if (wcBegin(pub)) wcSendKey(pub); break; }
+    case WC_QUERY:  wcSendStatus(); break;
+    case WC_FORGET: wcForget(); WiFi.disconnect(false, true); wifiReady = false; wcSendStatus(); break;
+    case WC_SET: {
+      static uint8_t raw[512];
+      int n = wcDecodePairs(data + 1, dlen - 1, raw, sizeof(raw));
+      if (n < 32 + 12 + 16) { wcSendStatus(); break; }       // too short to be valid
+      const uint8_t *peerPub = raw;
+      const uint8_t *nonce   = raw + 32;
+      int ctLen = (n - 44) - 16;
+      const uint8_t *ct  = raw + 44;
+      const uint8_t *tag = ct + ctLen;
+      uint8_t key[32]; static uint8_t pt[256];
+      bool ok = (ctLen > 0 && ctLen <= (int)sizeof(pt)) && wcDeriveKey(peerPub, key)
+                && wcGcmDecrypt(key, nonce, ct, ctLen, tag, pt);
+      mbedtls_platform_zeroize(key, sizeof(key));
+      if (!ok) { wcSendStatusCode(2); break; }               // creds rejected (decrypt/auth failed)
+      // plaintext: <ssidLen> <ssid…> <passLen> <pass…>
+      String ssid, pass; bool parsed = false; int i = 0;
+      if (i < ctLen) { int sl = pt[i++];
+        if (i + sl <= ctLen) { for (int k = 0; k < sl; k++) ssid += (char)pt[i++];
+          if (i < ctLen) { int pl = pt[i++];
+            if (i + pl <= ctLen) { for (int k = 0; k < pl; k++) pass += (char)pt[i++]; parsed = true; } } } }
+      mbedtls_platform_zeroize(pt, sizeof(pt));
+      if (parsed && ssid.length() > 0) wcApplyCreds(ssid, pass);
+      wcSendStatus();
+      break;
+    }
+    default: break;
+  }
+}
+
+static void tcpInit() {
+  wcLoadCreds();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+  Serial.printf("Connecting to Wi-Fi \"%s\"", g_ssid.c_str());
   uint8_t tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 40) {   // ~16 s, non-fatal
     delay(400);
