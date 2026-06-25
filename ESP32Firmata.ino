@@ -1799,13 +1799,23 @@ static bool wcConnect() {
   return false;
 }
 
+// Try new creds; persist to NVS ONLY if they actually connect. On failure, roll
+// back to the previously-working creds and reconnect — so a wrong password can't
+// brick the board's connection or get stored. Returns true iff the new creds joined.
 static bool wcApplyCreds(const String &ssid, const String &pass) {
+  String prevSsid = g_ssid, prevPass = g_pass;
+  bool wasConnected = (WiFi.status() == WL_CONNECTED);
   g_ssid = ssid; g_pass = pass;
-  wcPrefs.begin("wifiprov", false);
-  wcPrefs.putString("ssid", ssid);
-  wcPrefs.putString("pass", pass);
-  wcPrefs.end();
-  return wcConnect();
+  if (wcConnect()) {                           // new creds joined -> persist them
+    wcPrefs.begin("wifiprov", false);
+    wcPrefs.putString("ssid", ssid);
+    wcPrefs.putString("pass", pass);
+    wcPrefs.end();
+    return true;
+  }
+  g_ssid = prevSsid; g_pass = prevPass;        // failed -> revert, leave NVS untouched
+  if (wasConnected) wcConnect();               // restore the previously-working network
+  return false;
 }
 
 static void wcForget() {
@@ -1930,8 +1940,8 @@ static void handleWiFiConfig(const uint8_t *data, int dlen) {
           if (i < ctLen) { int pl = pt[i++];
             if (i + pl <= ctLen) { for (int k = 0; k < pl; k++) pass += (char)pt[i++]; parsed = true; } } } }
       mbedtls_platform_zeroize(pt, sizeof(pt));
-      if (parsed && ssid.length() > 0) wcApplyCreds(ssid, pass);
-      wcSendStatus();
+      bool applied = (parsed && ssid.length() > 0) && wcApplyCreds(ssid, pass);
+      wcSendStatusCode(applied ? 1 : 0);   // 1 = joined the requested network, 0 = not (kept old)
       break;
     }
     default: break;
