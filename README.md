@@ -235,10 +235,12 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   (`0` ok, `1` notFound, `2` stale, `3` typeMismatch, `4` tooBig, `5` allocFailed). `CMP`
   (`0x27`) materialises `(A op B) ? 1 : 0` into a register (same operands/promotion as `IF`).
   `HTTP_REPLY` carries status (`lo hi`) + body (14-bit pairs, up to ~4 KB) back to a host.
-* Raw-string ops (`board.string`, over the **selected** body): `STR_BODY_LEN` (`0x28`) →
-  byte length; `STR_EQUALS` (`0x29`) → whole body == `<str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`)
-  → index of `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`,
-  `R[found]`=`1`/`0`. (`contains` reuses `BODY_CONTAINS` `0x18`.)
+* `JSON_GET_STRING` (`0x2C`): copy the **content** (unquoted) of the JSON string at `<path>`
+  from the live body into a snapshot slot — backs `board.json.getString` → a `StringHandle`.
+* Raw-string ops on a selected string (`board.string`): `STR_BODY_LEN` (`0x28`) → byte
+  length; `STR_EQUALS` (`0x29`) → `== <str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`) → index of
+  `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`, `R[found]`=`1`/`0`.
+  (`contains` reuses `BODY_CONTAINS` `0x18`.)
 
 `if`/`else` is laid out so the byte counts line up:
 `[IF skip=thenLen] [then bytes] [SKIP skip=elseLen] [else bytes]` — a false `IF`

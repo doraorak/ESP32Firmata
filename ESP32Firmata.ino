@@ -179,6 +179,7 @@ static const uint8_t SCHED_EXT_STR_BODY_LEN  = 0x28;  // R[dst] = byte length of
 static const uint8_t SCHED_EXT_STR_EQUALS    = 0x29;  // R[dst] = (selected body == s) ? 1 : 0
 static const uint8_t SCHED_EXT_STR_INDEXOF   = 0x2A;  // R[dst] = index of s in body, or -1
 static const uint8_t SCHED_EXT_STR_TO_NUM    = 0x2B;  // R[dst] = body parsed as int; R[found] = 0/1
+static const uint8_t SCHED_EXT_JSON_GET_STRING = 0x2C;  // copy a JSON string's content at path into a snapshot slot
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -1458,6 +1459,27 @@ class Scheduler {
     snapBuf[slot] = nb; snapLen[slot] = n;
     lastStatus = ST_OK;
   }
+  // 0x2C: copy the CONTENT (unquoted) of the JSON string at <path> from the LIVE body into
+  //       snapshot slot <slot>. Backs board.json.getString → a StringHandle for board.string.
+  void doJsonGetString(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int slot = p[1]; if (slot < 0 || slot >= NUM_SNAP) return;
+    int pathLen = p[2] | (p[3] << 7);
+    if (4 + pathLen > plen) return;
+    const uint8_t *path = p + 4;
+    const uint8_t *b = (const uint8_t *)httpRespBody.c_str();
+    int blen = httpRespBody.length();
+    if (blen <= 0) { lastStatus = ST_NOT_FOUND; return; }
+    int s, e;
+    if (!jsonValueSpan(b, blen, path, pathLen, s, e) || e <= s) { lastStatus = ST_NOT_FOUND; return; }
+    if (b[s] != '"' || e - 1 <= s) { lastStatus = ST_TYPE_MISMATCH; return; }   // must be a JSON string
+    int cs = s + 1, n = (e - 1) - cs;                       // content between the quotes
+    uint8_t *nb = (uint8_t *)realloc(snapBuf[slot], n > 0 ? n : 1);
+    if (!nb) { lastStatus = ST_ALLOC_FAILED; return; }
+    if (n > 0) memcpy(nb, b + cs, n);
+    snapBuf[slot] = nb; snapLen[slot] = n;
+    lastStatus = ST_OK;
+  }
 
   // Internet action: a task (or live host) makes an HTTP(S) request over Wi-Fi.
   // ext payload: 0x15 method statusReg urlLo urlHi url[] bodyLo bodyHi body[].
@@ -1614,6 +1636,9 @@ class Scheduler {
         break;
       case SCHED_EXT_STR_TO_NUM:        // 0x2B dst found
         doStrToNum(payload, plen);
+        break;
+      case SCHED_EXT_JSON_GET_STRING:   // 0x2C slot pathLo pathHi path…
+        doJsonGetString(payload, plen);
         break;
     }
   }
