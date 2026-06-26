@@ -175,6 +175,10 @@ static const uint8_t SCHED_EXT_SELECT        = 0x24;  // pick inspection source 
 static const uint8_t SCHED_EXT_FREE          = 0x25;  // free a snapshot slot
 static const uint8_t SCHED_EXT_LAST_STATUS   = 0x26;  // R[dst] = status of last inspection op
 static const uint8_t SCHED_EXT_CMP           = 0x27;  // R[dst] = (A <op> B) ? 1 : 0
+static const uint8_t SCHED_EXT_STR_BODY_LEN  = 0x28;  // R[dst] = byte length of the selected body
+static const uint8_t SCHED_EXT_STR_EQUALS    = 0x29;  // R[dst] = (selected body == s) ? 1 : 0
+static const uint8_t SCHED_EXT_STR_INDEXOF   = 0x2A;  // R[dst] = index of s in body, or -1
+static const uint8_t SCHED_EXT_STR_TO_NUM    = 0x2B;  // R[dst] = body parsed as int; R[found] = 0/1
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -1227,6 +1231,73 @@ class Scheduler {
     if (blen <= 0 || !b) { lastStatus = ST_NOT_FOUND; return; }
     regs[dst] = bytesContain(b, 0, blen, needle, strLen) ? 1 : 0; lastStatus = ST_OK;
   }
+  // 0x28: R[dst] = byte length of the selected body.
+  void doStrBodyLen(const uint8_t *p, int plen) {
+    if (plen < 2) return;
+    int dst = p[1] & 0x0F;
+    regs[dst] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (!b) { lastStatus = ST_NOT_FOUND; return; }
+    regs[dst] = blen; lastStatus = ST_OK;
+  }
+  // 0x29: R[dst] = (whole selected body == <str>) ? 1 : 0.
+  void doStrEquals(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int dst = p[1] & 0x0F;
+    int strLen = p[2] | (p[3] << 7);
+    if (4 + strLen > plen) return;
+    const uint8_t *needle = p + 4;
+    regs[dst] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (!b) { lastStatus = ST_NOT_FOUND; return; }
+    regs[dst] = bytesEqual(b, 0, blen, needle, strLen) ? 1 : 0; lastStatus = ST_OK;
+  }
+  // 0x2A: R[dst] = index of <str> in the selected body, or -1.
+  void doStrIndexOf(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int dst = p[1] & 0x0F;
+    int strLen = p[2] | (p[3] << 7);
+    if (4 + strLen > plen) return;
+    const uint8_t *needle = p + 4;
+    regs[dst] = -1;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (!b) { lastStatus = ST_NOT_FOUND; return; }
+    if (strLen == 0) { regs[dst] = 0; lastStatus = ST_OK; return; }
+    if (blen >= strLen) {
+      for (int i = 0; i <= blen - strLen; i++) {
+        bool m = true;
+        for (int t = 0; t < strLen; t++) if (b[i + t] != needle[t]) { m = false; break; }
+        if (m) { regs[dst] = i; break; }
+      }
+    }
+    lastStatus = ST_OK;
+  }
+  // 0x2B: R[dst] = body parsed as a leading integer; R[found] = 0/1.
+  void doStrToNum(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    int dst = p[1] & 0x0F, foundReg = p[2] & 0x0F;
+    regs[dst] = 0; regs[foundReg] = 0;
+    int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
+    if (stale) { lastStatus = ST_STALE; return; }
+    if (!b || blen <= 0) { lastStatus = ST_NOT_FOUND; return; }
+    int i = 0;
+    while (i < blen && (b[i] == 0x20 || b[i] == 0x09)) i++;   // skip leading whitespace
+    bool negative = false;
+    if (i < blen && b[i] == 0x2D) { negative = true; i++; }
+    else if (i < blen && b[i] == 0x2B) i++;
+    int32_t val = 0; bool any = false;
+    while (i < blen && b[i] >= 0x30 && b[i] <= 0x39) {
+      any = true;
+      if (val > 214748364) val = 2147483647;                 // clamp to int32 max
+      else val = val * 10 + (int32_t)(b[i] - 0x30);
+      i++;
+    }
+    if (any) { regs[dst] = negative ? -val : val; regs[foundReg] = 1; lastStatus = ST_OK; }
+    else lastStatus = ST_TYPE_MISMATCH;
+  }
   // 0x1D: F[dst] = json float at <path>; R[found] = 0/1.
   void doJsonFloat(const uint8_t *p, int plen) {
     if (plen < 5) return;
@@ -1531,6 +1602,18 @@ class Scheduler {
         break;
       case SCHED_EXT_CMP:                // 0x27 op dst <operandA> <operandB>
         doCmp(payload, plen);
+        break;
+      case SCHED_EXT_STR_BODY_LEN:      // 0x28 dst
+        doStrBodyLen(payload, plen);
+        break;
+      case SCHED_EXT_STR_EQUALS:        // 0x29 dst strLo strHi str…
+        doStrEquals(payload, plen);
+        break;
+      case SCHED_EXT_STR_INDEXOF:       // 0x2A dst strLo strHi str…
+        doStrIndexOf(payload, plen);
+        break;
+      case SCHED_EXT_STR_TO_NUM:        // 0x2B dst found
+        doStrToNum(payload, plen);
         break;
     }
   }
