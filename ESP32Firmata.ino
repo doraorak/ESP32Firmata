@@ -180,6 +180,7 @@ static const uint8_t SCHED_EXT_STR_EQUALS    = 0x29;  // R[dst] = (selected body
 static const uint8_t SCHED_EXT_STR_INDEXOF   = 0x2A;  // R[dst] = index of s in body, or -1
 static const uint8_t SCHED_EXT_STR_TO_NUM    = 0x2B;  // R[dst] = body parsed as int; R[found] = 0/1
 static const uint8_t SCHED_EXT_JSON_GET_STRING = 0x2C;  // copy a JSON string's content at path into a snapshot slot
+static const uint8_t SCHED_EXT_STR_SET_SLOT    = 0x2D;  // set a snapshot slot's content to a literal string
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -320,7 +321,7 @@ static ContinuousRead contReads[MAX_CONT_READS];
 //  further down — after the send helpers they depend on.)
 static const uint8_t NUM_SCHED_REGS = 16;
 static const uint8_t NUM_FLOAT_REGS = 8;     // F0..F7 (logic extension)
-static const int     NUM_SNAP       = 2;     // response-body snapshot slots
+static const int     NUM_SNAP       = 5;     // response-body snapshot slots
 
 // Scratch buffer used to build outgoing frames.
 static uint8_t   frameBuf[2048];
@@ -1480,6 +1481,19 @@ class Scheduler {
     snapBuf[slot] = nb; snapLen[slot] = n;
     lastStatus = ST_OK;
   }
+  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs the
+  //       standalone StringHandle initialiser (board.string ops then run on the slot).
+  void doStrSetSlot(const uint8_t *p, int plen) {
+    if (plen < 4) return;
+    int slot = p[1]; if (slot < 0 || slot >= NUM_SNAP) return;
+    int sLen = p[2] | (p[3] << 7);
+    if (4 + sLen > plen) return;
+    uint8_t *nb = (uint8_t *)realloc(snapBuf[slot], sLen > 0 ? sLen : 1);
+    if (!nb) { lastStatus = ST_ALLOC_FAILED; return; }
+    if (sLen > 0) memcpy(nb, p + 4, sLen);
+    snapBuf[slot] = nb; snapLen[slot] = sLen;
+    lastStatus = ST_OK;
+  }
 
   // Internet action: a task (or live host) makes an HTTP(S) request over Wi-Fi.
   // ext payload: 0x15 method statusReg urlLo urlHi url[] bodyLo bodyHi body[].
@@ -1639,6 +1653,9 @@ class Scheduler {
         break;
       case SCHED_EXT_JSON_GET_STRING:   // 0x2C slot pathLo pathHi path…
         doJsonGetString(payload, plen);
+        break;
+      case SCHED_EXT_STR_SET_SLOT:      // 0x2D slot strLo strHi str…
+        doStrSetSlot(payload, plen);
         break;
     }
   }

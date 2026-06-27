@@ -228,7 +228,7 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   `5` bool, `6` null. `JSON_SIZE` (`0x1F`) → span byte length; `STR_LEN` (`0x20`) → string
   content length; `HEAP` (`0x21`) → free heap + largest block.
 * Handles: `REQUEST_COUNT` (`0x22`) reads the generation (++ per request). `SNAPSHOT`
-  (`0x23`) copies a value into one of 2 grow-only slots that outlive the next request
+  (`0x23`) copies a value into one of 5 grow-only slots that outlive the next request
   (`<pathLen>` 0 = whole body). `SELECT` (`0x24`) picks the inspection source: `0` = live
   (marked **stale** if `requestCount != R[expGenReg]`), `k` = snapshot slot `k-1`. `FREE`
   (`0x25`) releases a slot. `LAST_STATUS` (`0x26`) → the last inspection op's status
@@ -237,6 +237,8 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   `HTTP_REPLY` carries status (`lo hi`) + body (14-bit pairs, up to ~4 KB) back to a host.
 * `JSON_GET_STRING` (`0x2C`): copy the **content** (unquoted) of the JSON string at `<path>`
   from the live body into a snapshot slot — backs `board.json.getString` → a `StringHandle`.
+* `STR_SET_SLOT` (`0x2D`): set a snapshot slot to a **literal** string from the payload —
+  backs the standalone `StringHandle("…", on: board)` (a `board.string` value, no HTTP body).
 * Raw-string ops on a selected string (`board.string`): `STR_BODY_LEN` (`0x28`) → byte
   length; `STR_EQUALS` (`0x29`) → `== <str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`) → index of
   `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`, `R[found]`=`1`/`0`.
