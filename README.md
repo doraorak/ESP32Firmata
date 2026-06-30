@@ -135,32 +135,29 @@ standard build stays on `no-extension`.
 ### High-level API (SwiftFirmataClient `FirmataTaskRecorder`)
 
 ```swift
-let rec = board.makeTask(id: 1)
-rec.setRegister(0, to: 25)                 // R0 = 25
-rec.readAnalog(channel: 0, into: 1)        // R1 = analogRead(A0)
-rec.ifTrue(.register(1), .greaterThan, .register(0)) {   // if R1 > R0
-    $0.digitalWrite(pin: 2, value: 0)      //   then: LED off
-} elseDo: {
-    $0.digitalWrite(pin: 2, value: 1)      //   else: LED on
+try await client.uploadTask(id: 1, repeatEvery: .seconds(1)) { t in   // loop every 1 s
+    t.setRegister(.reg(0), to: 25)             // R0 = 25
+    t.analogRead(into: .reg(1), channel: 0)    // R1 = analogRead(A0)
+    t.ifTrue(.reg(1), .greaterThan, .reg(0),   // if R1 > R0
+        then:   { $0.digitalWrite(pin: 2, high: false) },   // LED off
+        elseDo: { $0.digitalWrite(pin: 2, high: true) })    // LED on
 }
-rec.delay(ms: 1000)                        // loop every 1 s
-board.schedule(rec, afterMs: 0)
 ```
 
 | High-level | Effect |
 |---|---|
-| `setRegister(_ d, to: const)` | `R[d] = const` |
-| `readDigital(pin:, into: d)` | `R[d] = digitalRead(pin)` |
-| `readAnalog(channel:, into: d)` | `R[d] = analogRead(channel)` |
+| `setRegister(_:to:)` | `R[d] = const` |
+| `digitalRead(into:pin:)` | `R[d] = digitalRead(pin)` |
+| `analogRead(into:channel:)` | `R[d] = analogRead(channel)` |
 | `ifTrue(_:_:_:then:elseDo:)` | compare two operands; run `then`, else `elseDo` |
 | `httpGet(_ url, statusInto: s)` | HTTP(S) GET over Wi-Fi; `R[s]`=status, body retained |
 | `httpPost(_ url, body:, statusInto: s)` | as above, POST with a JSON body |
-| `jsonNumber(_ path, scaledBy:)` | `R` = JSON number at path × 10ⁿ (truncated); returns operand |
+| `json.getNumber(body, path, scaledBy:)` | `R` = JSON number at path × 10ⁿ (truncated); returns operand |
 | `jsonStringEquals(_ path, _ value)` / `jsonStringContains(_ path, _ sub)` | compare JSON string at path → `R` (0/1) |
 | `bodyContains(_ text)` | substring over the whole body → `R` (0/1) |
 
 So a task can fetch JSON from the internet and act on it with no host connected —
-e.g. `httpGet` a quote endpoint, `jsonNumber("changePercent", scaledBy: 2)`, then
+e.g. `httpGet` a quote endpoint, `json.getNumber(body, "changePercent", scaledBy: 2)`, then
 `ifTrue` on that register to drive a pin. The client can also call `httpGet`/
 `httpPost` **live** and inspect the `HTTPResponse` (status + body) on the host with
 `HTTPResponse.json()` / `.decode(_:)`.
@@ -236,10 +233,9 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   (`0x27`) materialises `(A op B) ? 1 : 0` into a register (same operands/promotion as `IF`).
   `HTTP_REPLY` carries status (`lo hi`) + body (14-bit pairs, up to ~4 KB) back to a host.
 * `JSON_GET_STRING` (`0x2C`): copy the **content** (unquoted) of the JSON string at `<path>`
-  from the live body into a snapshot slot — backs `board.json.getString` → a `StringHandle`.
+  from the live body into a snapshot slot — backs `board.json.getString` → a `TaskString`.
 * `STR_SET_SLOT` (`0x2D`): set a snapshot slot to a **literal** string (`board.string.createString`).
-* `STR_COPY_SLOT` (`0x2E`): copy one snapshot slot into another (`StringHandle.changeSlot` /
-  `board.snapshotString`). The 12 slots are partitioned: JSON snapshots use 0–1, strings 2–11.
+* `STR_COPY_SLOT` (`0x2E`): copy one snapshot slot into another (`TaskString.changeSlot`). The 12 slots are partitioned: JSON snapshots use 0–1, strings 2–11.
 * Raw-string ops on a selected string (`board.string`): `STR_BODY_LEN` (`0x28`) → byte
   length; `STR_EQUALS` (`0x29`) → `== <str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`) → index of
   `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`, `R[found]`=`1`/`0`.

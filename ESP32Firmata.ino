@@ -1462,7 +1462,7 @@ class Scheduler {
     lastStatus = ST_OK;
   }
   // 0x2C: copy the CONTENT (unquoted) of the JSON string at <path> from the LIVE body into
-  //       snapshot slot <slot>. Backs board.json.getString → a StringHandle for board.string.
+  //       snapshot slot <slot>. Backs board.json.getString → a TaskString for board.string.
   void doJsonGetString(const uint8_t *p, int plen) {
     if (plen < 4) return;
     int slot = p[1]; if (slot < 0 || slot >= NUM_SNAP) return;
@@ -1482,8 +1482,8 @@ class Scheduler {
     snapBuf[slot] = nb; snapLen[slot] = n;
     lastStatus = ST_OK;
   }
-  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs the
-  //       standalone StringHandle initialiser (board.string ops then run on the slot).
+  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs
+  //       board.string.createString (board.string ops then run on the slot).
   void doStrSetSlot(const uint8_t *p, int plen) {
     if (plen < 4) return;
     int slot = p[1]; if (slot < 0 || slot >= NUM_SNAP) return;
@@ -1495,7 +1495,7 @@ class Scheduler {
     snapBuf[slot] = nb; snapLen[slot] = sLen;
     lastStatus = ST_OK;
   }
-  // 0x2E: copy snapshot slot <src> content into slot <dst> (backs string changeSlot / snapshotString).
+  // 0x2E: copy snapshot slot <src> content into slot <dst> (backs string changeSlot).
   void doStrCopySlot(const uint8_t *p, int plen) {
     if (plen < 3) return;
     int dst = p[1], src = p[2];
