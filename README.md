@@ -236,6 +236,8 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   from the live body into a snapshot slot — backs `board.json.getString` → a `TaskString`.
 * `STR_SET_SLOT` (`0x2D`): set a snapshot slot to a **literal** string (`board.string.createString`).
 * `STR_COPY_SLOT` (`0x2E`): copy one snapshot slot into another (`TaskString.changeSlot`). The 12 slots are partitioned: JSON snapshots use 0–1, strings 2–11.
+* `I2C_READ` (`0x2F`): write a register, then read 1–4 bytes from an I2C device into `R[dst]` (big-endian) — `board.i2cRead`. Lets a task act on an I2C sensor with no host connected.
+* `EMIT_STRING` (`0x30`): the running task sends a `STRING_DATA` to the connected host (`board.sendString`), over TCP or BLE; no-op if nobody is connected.
 * Raw-string ops on a selected string (`board.string`): `STR_BODY_LEN` (`0x28`) → byte
   length; `STR_EQUALS` (`0x29`) → `== <str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`) → index of
   `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`, `R[found]`=`1`/`0`.

@@ -182,6 +182,8 @@ static const uint8_t SCHED_EXT_STR_TO_NUM    = 0x2B;  // R[dst] = body parsed as
 static const uint8_t SCHED_EXT_JSON_GET_STRING = 0x2C;  // copy a JSON string's content at path into a snapshot slot
 static const uint8_t SCHED_EXT_STR_SET_SLOT    = 0x2D;  // set a snapshot slot's content to a literal string
 static const uint8_t SCHED_EXT_STR_COPY_SLOT   = 0x2E;  // copy one snapshot slot's content into another
+static const uint8_t SCHED_EXT_I2C_READ        = 0x2F;  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
+static const uint8_t SCHED_EXT_EMIT_STRING     = 0x30;  // device -> host: send a STRING_DATA frame to the master
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -1509,6 +1511,39 @@ class Scheduler {
     lastStatus = ST_OK;
   }
 
+  // 0x2F: write the register pointer, read <count> (1..4) bytes from the I2C device, and
+  //       store them big-endian in R[dst]. Lets a task act on an I2C sensor with nobody
+  //       connected (the read reply is consumed on-device, not sent to a host).
+  void doI2CReadReg(const uint8_t *p, int plen) {
+    if (plen < 6) return;
+    uint16_t address = p[1] & 0x7F;
+    int reg   = p[2] | (p[3] << 7);
+    int count = p[4]; if (count < 1) count = 1; if (count > 4) count = 4;
+    int dst   = p[5] & 0x0F;
+    Wire.beginTransmission(address);
+    Wire.write((uint8_t)reg);
+    Wire.endTransmission();
+    if (i2cReadDelayUs) delayMicroseconds(i2cReadDelayUs);
+    int got = Wire.requestFrom((int)address, count);
+    int32_t v = 0; int i = 0;
+    while (Wire.available() && i < got && i < count) { v = (v << 8) | (Wire.read() & 0xFF); i++; }
+    regs[dst] = v;
+  }
+
+  // 0x30: send a STRING_DATA frame (board -> host) so a running task can report a message
+  //       to a connected master (TCP or BLE). No-op if nobody is connected.
+  void doEmitString(const uint8_t *p, int plen) {
+    if (plen < 3) return;
+    int sLen = p[1] | (p[2] << 7);
+    if (3 + sLen > plen) return;
+    int n = 0;
+    frameBuf[n++] = START_SYSEX;
+    frameBuf[n++] = STRING_DATA;
+    for (int k = 0; k < sLen; k++) { frameBuf[n++] = p[3 + k] & 0x7F; frameBuf[n++] = 0; }
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+  }
+
   // Internet action: a task (or live host) makes an HTTP(S) request over Wi-Fi.
   // ext payload: 0x15 method statusReg urlLo urlHi url[] bodyLo bodyHi body[].
   // method 0=GET 1=POST. Stores HTTP status in R[statusReg] (0 = Wi-Fi down/error)
@@ -1673,6 +1708,12 @@ class Scheduler {
         break;
       case SCHED_EXT_STR_COPY_SLOT:     // 0x2E dst src
         doStrCopySlot(payload, plen);
+        break;
+      case SCHED_EXT_I2C_READ:          // 0x2F addr regLo regHi count dst
+        doI2CReadReg(payload, plen);
+        break;
+      case SCHED_EXT_EMIT_STRING:       // 0x30 lenLo lenHi bytes…
+        doEmitString(payload, plen);
         break;
     }
   }
