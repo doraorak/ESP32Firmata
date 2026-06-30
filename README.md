@@ -136,8 +136,8 @@ standard build stays on `no-extension`.
 
 ```swift
 try await client.uploadTask(id: 1, repeatEvery: .seconds(1)) { t in   // loop every 1 s
-    t.setRegister(.reg(0), to: 25)             // R0 = 25
-    t.analogRead(into: .reg(1), channel: 0)    // R1 = analogRead(A0)
+    t.setRegister(.reg(0), to: .number(25))             // R0 = 25
+    t.analogRead(into: .reg(1), channel: .channel(0))    // R1 = analogRead(A0)
     t.ifTrue(.reg(1), .greaterThan, .reg(0),   // if R1 > R0
         then:   { $0.digitalWrite(pin: 2, high: false) },   // LED off
         elseDo: { $0.digitalWrite(pin: 2, high: true) })    // LED on
