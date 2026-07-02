@@ -1,46 +1,17 @@
 /*
- * ESP32Firmata.ino  —  Firmata 2.x firmware for the original ESP32
- * ---------------------------------------------------------------------------
- * Self-contained (no external Firmata library) firmware that speaks the
- * Firmata protocol over BOTH transports at once (set either ENABLE_ define to
- * 0 to force a single one):
+ * ESP32Firmata.ino — Firmata 2.x firmware for the original ESP32 (C++/Arduino).
  *
- *   ENABLE_WIFI -> Wi-Fi / TCP + Bonjour (mDNS)  ← matches BonjourTransport.swift
- *   ENABLE_BLE  -> BLE Nordic UART Service (NUS)  ← matches BLETransport.swift
- *
- * Only one client controls the board at a time. The policy is LATEST-WINS:
- * a new connection on either transport evicts the current holder (single Firmata
- * master — fully standard-compliant, no extra wire bytes). Scheduler tasks are
- * global and survive eviction/disconnect.
- *
- * It is byte-for-byte compatible with the SwiftFirmataClient package — the
- * tested wire formats (firmware report, capability, analog-mapping, pin-state,
- * digital/analog I/O, extended-analog, I2C) follow the protocol exactly as
- * parsed by FirmataParser.swift.
- *
- * ── Bonjour side ──
- *   Advertises  _firmata._tcp  on port 3030 with TXT records:
- *       ip   = <device IP>     (lets the client skip flaky mDNS A-record
- *       port = 3030             resolution — see BonjourTransport.swift)
- *
- * ── BLE side ──
- *   Service  6E400001-B5A3-F393-E0A9-E50E24DCCA9E
- *   RX char  6E400002-...  WRITE / WRITE_NR   (host  -> device)
- *   TX char  6E400003-...  NOTIFY             (device -> host)
- *   The service UUID is placed in the advertisement so the client's
- *   service-filtered scan (scanForPeripherals(withServices:)) finds it.
- *
- * Target:  original ESP32 (ESP32-WROOM-32 / -WROVER) — "ESP32 Dev Module".
- * Core:    ESP32 Arduino core 3.x (recommended) or 2.x (fallback supported).
- *
- *   For the BLE build choose a partition scheme with a large app partition
- *   (Tools ▸ Partition Scheme ▸ "Minimal SPIFFS (1.9MB APP)" or "Huge APP").
- * ---------------------------------------------------------------------------
+ * Self-contained (no external Firmata library). Speaks Firmata over three
+ * transports — Wi-Fi/TCP + Bonjour, BLE Nordic UART (NimBLE), and USB serial
+ * (first byte claims the session and silences the console) — one master at a
+ * time, latest wins; scheduler tasks survive eviction and disconnect. Includes
+ * the on-device task extension: registers, branches, arithmetic, HTTP(S) +
+ * JSON/string inspection, nested tasks (ext ops 0x10–0x30 — byte-identical to
+ * ESP32FirmataSwift; wire spec in that repo's README). ENABLE_WIFI/ENABLE_BLE
+ * gate the radio transports at compile time.
  */
 
-// ===========================================================================
-//  USER CONFIGURATION
-// ===========================================================================
+/* ==== USER CONFIGURATION ================================================ */
 
 #define ENABLE_WIFI        1          // Wi-Fi/TCP + Bonjour   (set 0 to disable)
 #define ENABLE_BLE         1          // BLE Nordic UART Svc   (set 0 to disable)
@@ -65,18 +36,14 @@
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
-// ===========================================================================
-//  Core-version helper (3.x vs 2.x differ for PWM / LEDC APIs)
-// ===========================================================================
+/* ==== Core-version helper (3.x vs 2.x differ for PWM / LEDC APIs) ======= */
 #if defined(ESP_ARDUINO_VERSION) && defined(ESP_ARDUINO_VERSION_VAL)
   #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
     #define FIRMATA_CORE3 1
   #endif
 #endif
 
-// ===========================================================================
-//  Transport-specific includes
-// ===========================================================================
+/* ==== Transport-specific includes ======================================= */
 #if ENABLE_WIFI
   #include <esp_log.h>
 #include <WiFi.h>
@@ -103,9 +70,7 @@
 #endif
 #include <Wire.h>
 
-// ===========================================================================
-//  Firmata protocol constants
-// ===========================================================================
+/* ==== Firmata protocol constants ======================================== */
 static const uint8_t ANALOG_MESSAGE        = 0xE0;
 static const uint8_t DIGITAL_MESSAGE       = 0x90;
 static const uint8_t REPORT_ANALOG         = 0xC0;
@@ -146,10 +111,10 @@ static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
 static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
 static const uint8_t SCHED_EXT_HTTP_REPLY  = 0x0B;   // device -> host: HTTP status + body
 
-// --- Logic extension (see NONSTANDARD.md) -----------------------------------
-// On-device registers + if/else so a stored task can make decisions by itself.
-// Carried under the standard Scheduler's reserved extension command (0x7F,
-// EXTENDED_SCHEDULER_COMMAND) so a base Firmata scheduler ignores it cleanly.
+/* --- Logic extension (see NONSTANDARD.md) -----------------------------------
+   On-device registers + if/else so a stored task can make decisions by itself.
+   Carried under the standard Scheduler's reserved extension command (0x7F,
+   EXTENDED_SCHEDULER_COMMAND) so a base Firmata scheduler ignores it cleanly. */
 static const uint8_t SCHED_EXT_COMMAND      = 0x7F;  // EXTENDED_SCHEDULER_COMMAND
 static const uint8_t SCHED_EXT_SET          = 0x10;  // R[d] = const
 static const uint8_t SCHED_EXT_READ_DIGITAL = 0x11;  // R[d] = digitalRead(pin)
@@ -194,12 +159,12 @@ static const int32_t ST_TYPE_MISMATCH = 3;
 static const int32_t ST_TOO_BIG       = 4;
 static const int32_t ST_ALLOC_FAILED  = 5;
 
-// --- Encrypted Wi-Fi provisioning over any transport (non-standard) ----------
-// Top-level SysEx in Firmata's reserved user range (0x00-0x0F). Lets a client
-// hand the board its Wi-Fi credentials — typically over BLE before Wi-Fi is up —
-// via an ephemeral X25519 ECDH handshake (HKDF-SHA256 -> AES-256-GCM), so a
-// passive sniffer never sees the password. Provisioned creds persist in NVS and
-// override the compile-time WIFI_SSID/WIFI_PASS on the next boot.
+/* --- Encrypted Wi-Fi provisioning over any transport (non-standard) ----------
+   Top-level SysEx in Firmata's reserved user range (0x00-0x0F). Lets a client
+   hand the board its Wi-Fi credentials — typically over BLE before Wi-Fi is up —
+   via an ephemeral X25519 ECDH handshake (HKDF-SHA256 -> AES-256-GCM), so a
+   passive sniffer never sees the password. Provisioned creds persist in NVS and
+   override the compile-time WIFI_SSID/WIFI_PASS on the next boot. */
 static const uint8_t WIFI_CONFIG = 0x0C;
 static const uint8_t WC_SET    = 0x00;  // host->dev: <clientPub><nonce><ct+tag>  (set + connect + save)
 static const uint8_t WC_FORGET = 0x01;  // host->dev: clear stored creds
@@ -217,9 +182,7 @@ static const uint8_t PIN_MODE_PWM    = 0x03;
 static const uint8_t PIN_MODE_I2C    = 0x06;
 static const uint8_t PIN_MODE_PULLUP = 0x0B;
 
-// ===========================================================================
-//  ESP32 pin model
-// ===========================================================================
+/* ==== ESP32 pin model =================================================== */
 static const uint8_t TOTAL_PINS = 40;                 // GPIO 0..39
 static const uint8_t NUM_PORTS  = (TOTAL_PINS + 7) / 8; // 5 ports
 
@@ -232,16 +195,15 @@ static const uint8_t NUM_ANALOG    = sizeof(ANALOG_PINS) / sizeof(ANALOG_PINS[0]
 static const uint8_t I2C_SDA_PIN = 21;
 static const uint8_t I2C_SCL_PIN = 22;
 
-// ===========================================================================
-//  Types used in function signatures — must be declared before the first
-//  function so Arduino's auto-generated prototypes (inserted just above the
-//  first function) can see them.
-// ===========================================================================
+/* ==== Types used in function signatures — must be declared before the first
+    function so Arduino's auto-generated prototypes (inserted just above the
+    first function) can see them.
+   ==================== */
 static const int SYSEX_MAX = 512;   // fits an HTTP op's URL + body in one SysEx
 
-// Firmata input-parser state. Two independent instances exist: one for the live
-// host connection and one for replaying scheduler tasks — so a half-received
-// live message can never be corrupted by task playback (and vice-versa).
+/* Firmata input-parser state. Two independent instances exist: one for the live
+   host connection and one for replaying scheduler tasks — so a half-received
+   live message can never be corrupted by task playback (and vice-versa). */
 struct ParserState {
   bool    parsingSysex = false;
   int     waitForData = 0;
@@ -300,9 +262,7 @@ static int pinOfAnalogChannel(uint8_t ch) {
   return (ch < NUM_ANALOG) ? ANALOG_PINS[ch] : -1;
 }
 
-// ===========================================================================
-//  Runtime pin / reporting state
-// ===========================================================================
+/* ==== Runtime pin / reporting state ===================================== */
 static uint8_t  pinModes[TOTAL_PINS];   // current Firmata mode per pin
 static int      pinValues[TOTAL_PINS];  // last written output / PWM value
 static bool     pinConfigured[TOTAL_PINS]; // host explicitly set a digital mode
@@ -320,9 +280,9 @@ struct ContinuousRead { uint16_t address; int reg; uint16_t count; bool active; 
 static const uint8_t MAX_CONT_READS = 8;
 static ContinuousRead contReads[MAX_CONT_READS];
 
-// Non-standard scheduler registers: 16 global Int32s shared across tasks.
-// (The Scheduler and FirmataProtocol classes, and their instances, are defined
-//  further down — after the send helpers they depend on.)
+/* Non-standard scheduler registers: 16 global Int32s shared across tasks.
+   (The Scheduler and FirmataProtocol classes, and their instances, are defined
+    further down — after the send helpers they depend on.) */
 static const uint8_t NUM_SCHED_REGS = 16;
 static const uint8_t NUM_FLOAT_REGS = 8;     // F0..F7 (logic extension)
 static const int     NUM_SNAP       = 12;    // 2 JSON snapshot slots (0–1) + 10 string slots (2–11)
@@ -332,25 +292,22 @@ static uint8_t   frameBuf[2048];
 // Max response bytes retained for JSON/string inspection AND echoed to a host.
 static const int HTTP_PARSE_MAX = 4096;
 
-// ===========================================================================
-//  Dual-transport master arbitration (latest-wins)
-// ===========================================================================
-// Exactly one transport "owns" the board at a time. A new connection on either
-// transport calls claimMaster(), which evicts the other transport's holder.
+/* ==== Dual-transport master arbitration (latest-wins)
+   Exactly one transport "owns" the board at a time. A new connection on either
+   transport calls claimMaster(), which evicts the other transport's holder.
+   ==================== */
 enum ActiveTransport : uint8_t { TR_NONE = 0, TR_TCP, TR_BLE, TR_SERIAL };
 static ActiveTransport activeTransport = TR_NONE;
 
-// Console logging is gated: once a host starts speaking Firmata over USB serial,
-// log lines would corrupt the binary stream, so the serial claim silences both
-// our own prints and the IDF runtime logs for the rest of the session.
+/* Console logging is gated: once a host starts speaking Firmata over USB serial,
+   log lines would corrupt the binary stream, so the serial claim silences both
+   our own prints and the IDF runtime logs for the rest of the session. */
 static bool consoleQuiet = false;
 #define LOGP(...)  do { if (!consoleQuiet) Serial.print(__VA_ARGS__);   } while (0)
 #define LOGLN(...) do { if (!consoleQuiet) Serial.println(__VA_ARGS__); } while (0)
 #define LOGF(...)  do { if (!consoleQuiet) Serial.printf(__VA_ARGS__);  } while (0)
 
-// ===========================================================================
-//  Forward declarations
-// ===========================================================================
+/* ==== Forward declarations ============================================== */
 static void transportInit();
 static void transportPoll();
 static void serialPoll();
@@ -377,9 +334,7 @@ class FirmataProtocol;
 // PWM uses the Arduino core's analogWrite() (ESP32 core 3.x: LEDC-backed,
 // 8-bit). Firmata duty is 0..255, so callers clamp before writing.
 
-// ===========================================================================
-//  Outgoing Firmata messages
-// ===========================================================================
+/* ==== Outgoing Firmata messages ========================================= */
 static void sendProtocolVersion() {
   uint8_t b[3] = { REPORT_VERSION, PROTOCOL_MAJOR, PROTOCOL_MINOR };
   sendFrame(b, 3);
@@ -489,10 +444,9 @@ static void sendI2CReply(uint16_t address, int reg, const uint8_t *data, int cou
   sendFrame(frameBuf, n);
 }
 
-// ===========================================================================
-//  Pin I/O handlers
-// ===========================================================================
-// I2C device helpers (global; shared by the live handler and periodic sampling).
+/* ==== Pin I/O handlers
+   I2C device helpers (global; shared by the live handler and periodic sampling).
+   ==================== */
 static void i2cDoRead(uint16_t address, int reg, uint16_t count) {
   if (reg >= 0) {
     Wire.beginTransmission(address);
@@ -527,13 +481,12 @@ static void stopContinuousRead(uint16_t address) {
     if (contReads[i].active && contReads[i].address == address) contReads[i].active = false;
 }
 
-// ===========================================================================
-//  Live protocol handler
-//  Parses an incoming Firmata byte stream (its own ParserState) and applies
-//  each command. One instance drives the live transport; a second drives
-//  scheduler task replay. Both act on shared device state and route scheduler
-//  SysEx to the shared Scheduler.
-// ===========================================================================
+/* ==== Live protocol handler
+    Parses an incoming Firmata byte stream (its own ParserState) and applies
+    each command. One instance drives the live transport; a second drives
+    scheduler task replay. Both act on shared device state and route scheduler
+    SysEx to the shared Scheduler.
+   ==================== */
 class FirmataProtocol {
  public:
   ParserState ps;
@@ -775,15 +728,13 @@ class FirmataProtocol {
   }
 };
 
-// ===========================================================================
-//  Firmata Scheduler (SysEx 0x7B) — class
-//
-//  Stores tasks (recorded Firmata messages + delays) and replays them — through
-//  a dedicated FirmataProtocol instance (`replay`) — even with no host
-//  connected. Also owns the non-standard logic extension: 16 Int32 registers,
-//  if/else, and internet actions. Encoder7Bit helpers live here as methods.
-//  Wire format follows the official Firmata Scheduler protocol.
-// ===========================================================================
+/* ==== Firmata Scheduler (SysEx 0x7B) — class
+    Stores tasks (recorded Firmata messages + delays) and replays them — through
+    a dedicated FirmataProtocol instance (`replay`) — even with no host
+    connected. Also owns the non-standard logic extension: 16 Int32 registers,
+    if/else, and internet actions. Encoder7Bit helpers live here as methods.
+    Wire format follows the official Firmata Scheduler protocol.
+   ==================== */
 class Scheduler {
  public:
   SchedTask        tasks[MAX_TASKS];
@@ -864,12 +815,12 @@ class Scheduler {
     sendFrame(b, 5);
   }
 
-  // Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
-  // client recorder's addTask/deleteTask — a task spawning tasks). They arrive
-  // here through the replay handler exactly like host messages. The one hazard is
-  // a task deleting then re-creating its OWN id mid-run: never hand out the
-  // instance currently being replayed (`running`), whose data/pos execute() is
-  // iterating.
+  /* Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
+     client recorder's addTask/deleteTask — a task spawning tasks). They arrive
+     here through the replay handler exactly like host messages. The one hazard is
+     a task deleting then re-creating its OWN id mid-run: never hand out the
+     instance currently being replayed (`running`), whose data/pos execute() is
+     iterating. */
   void create(uint8_t id, uint16_t len) {
     if (find(id) || len > MAX_TASK_BYTES) { sendError(id); return; }
     for (uint8_t i = 0; i < MAX_TASKS; i++) {
@@ -960,9 +911,9 @@ class Scheduler {
     }
   }
 
-  // Read one operand starting at payload[i]; advances i. Type byte:
-  // 0 = int register, 1 = int const (5 enc bytes), 2 = float register,
-  // 3 = float const (IEEE754 bits, 5 enc bytes).
+  /* Read one operand starting at payload[i]; advances i. Type byte:
+     0 = int register, 1 = int const (5 enc bytes), 2 = float register,
+     3 = float const (IEEE754 bits, 5 enc bytes). */
   Operand readOperand(const uint8_t *payload, int plen, int &i) {
     Operand o = { false, 0, 0.0f };
     if (i >= plen) return o;
@@ -1152,11 +1103,11 @@ class Scheduler {
     return false;
   }
 
-  // ====== Response inspection — pick the source, then walk it in place ======
-  // Source is the live body or a snapshot slot, chosen by SELECT. Returns the
-  // buffer + length and sets `stale` when a borrowed (live) source was selected
-  // against an out-of-date generation. Each op records a result-status (read with
-  // SCHED_EXT_LAST_STATUS).
+  /* ====== Response inspection — pick the source, then walk it in place ======
+     Source is the live body or a snapshot slot, chosen by SELECT. Returns the
+     buffer + length and sets `stale` when a borrowed (live) source was selected
+     against an out-of-date generation. Each op records a result-status (read with
+     SCHED_EXT_LAST_STATUS). */
   const uint8_t *inspectBuf(int &blen, bool &stale) {
     if (inspectSel == 0) {
       blen = httpRespBody.length(); stale = inspectStale;
@@ -1527,9 +1478,9 @@ class Scheduler {
     lastStatus = ST_OK;
   }
 
-  // 0x2F: write the register pointer, read <count> (1..4) bytes from the I2C device, and
-  //       store them big-endian in R[dst]. Lets a task act on an I2C sensor with nobody
-  //       connected (the read reply is consumed on-device, not sent to a host).
+  /* 0x2F: write the register pointer, read <count> (1..4) bytes from the I2C device, and
+           store them big-endian in R[dst]. Lets a task act on an I2C sensor with nobody
+           connected (the read reply is consumed on-device, not sent to a host). */
   void doI2CReadReg(const uint8_t *p, int plen) {
     if (plen < 6) return;
     uint16_t address = p[1] & 0x7F;
@@ -1837,9 +1788,7 @@ static Scheduler       scheduler;
 static FirmataProtocol liveHandler;
 static FirmataProtocol replayHandler;
 
-// ===========================================================================
-//  Periodic sampling (device -> host)
-// ===========================================================================
+/* ==== Periodic sampling (device -> host) ================================ */
 static void checkDigitalInputs() {
   for (uint8_t port = 0; port < NUM_PORTS; port++) {
     if (!reportPort[port]) continue;
@@ -1875,12 +1824,11 @@ static void sampleAnalogAndI2C() {
   }
 }
 
-// ===========================================================================
-//  Reset
-// ===========================================================================
-// Light reset for a fresh connection: clears the live parser and reporting
-// state but PRESERVES pin modes/values and any running scheduler tasks, so a
-// queued task keeps running across client disconnect/reconnect.
+/* ==== Reset
+   Light reset for a fresh connection: clears the live parser and reporting
+   state but PRESERVES pin modes/values and any running scheduler tasks, so a
+   queued task keeps running across client disconnect/reconnect.
+   ==================== */
 static void resetSessionState() {
   liveHandler.ps = ParserState();
   analogReportMask = 0;
@@ -1909,9 +1857,9 @@ static void onNewConnection() {
   sendProtocolVersion();
 }
 
-// Build the standard STRING_DATA "eviction notice" the board sends to a client
-// right before handing the board to a newcomer (latest-wins). The sentinel
-// (0x01 + "EVICTED") is recognised by SwiftFirmataClient. Returns the length.
+/* Build the standard STRING_DATA "eviction notice" the board sends to a client
+   right before handing the board to a newcomer (latest-wins). The sentinel
+   (0x01 + "EVICTED") is recognised by SwiftFirmataClient. Returns the length. */
 static int buildEvictionFrame(uint8_t *out) {
   static const char *s = "\x01" "EVICTED";
   int n = 0;
@@ -1925,9 +1873,7 @@ static int buildEvictionFrame(uint8_t *out) {
   return n;
 }
 
-// ===========================================================================
-//                            TRANSPORT — Wi-Fi / Bonjour
-// ===========================================================================
+/* ==== TRANSPORT — Wi-Fi / Bonjour ======================================= */
 #if ENABLE_WIFI
 
 static WiFiServer tcpServer(FIRMATA_TCP_PORT);
@@ -1957,13 +1903,11 @@ static void startTcpServices() {
   LOGLN(WiFi.localIP());
 }
 
-// ===========================================================================
-//   Encrypted Wi-Fi provisioning  (WIFI_CONFIG SysEx — see the constants above)
-//
-//   Active creds = NVS-provisioned (if any) else the compile-time WIFI_SSID/PASS.
-//   A client hands over new creds via an ephemeral X25519 ECDH handshake
-//   (HKDF-SHA256 -> AES-256-GCM), typically over BLE while Wi-Fi is down.
-// ===========================================================================
+/* ==== Encrypted Wi-Fi provisioning  (WIFI_CONFIG SysEx — see the constants above)
+     Active creds = NVS-provisioned (if any) else the compile-time WIFI_SSID/PASS.
+     A client hands over new creds via an ephemeral X25519 ECDH handshake
+     (HKDF-SHA256 -> AES-256-GCM), typically over BLE while Wi-Fi is down.
+   ==================== */
 static Preferences wcPrefs;
 static String      g_ssid, g_pass;
 static bool        g_credsLoaded = false;
@@ -1998,9 +1942,9 @@ static bool wcConnect() {
   return false;
 }
 
-// Try new creds; persist to NVS ONLY if they actually connect. On failure, roll
-// back to the previously-working creds and reconnect — so a wrong password can't
-// brick the board's connection or get stored. Returns true iff the new creds joined.
+/* Try new creds; persist to NVS ONLY if they actually connect. On failure, roll
+   back to the previously-working creds and reconnect — so a wrong password can't
+   brick the board's connection or get stored. Returns true iff the new creds joined. */
 static bool wcApplyCreds(const String &ssid, const String &pass) {
   String prevSsid = g_ssid, prevPass = g_pass;
   bool wasConnected = (WiFi.status() == WL_CONNECTED);
@@ -2214,9 +2158,7 @@ static void tcpPoll() {
 
 #endif // ENABLE_WIFI
 
-// ===========================================================================
-//                            TRANSPORT — BLE (Nordic UART Service)
-// ===========================================================================
+/* ==== TRANSPORT — BLE (Nordic UART Service) ============================= */
 #if ENABLE_BLE
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -2303,9 +2245,9 @@ static void bleInit() {
 
   svc->start();
 
-  // The 128-bit service UUID goes in the advertisement (required for the client's
-  // service-filtered scan); the name rides in the scan response so both fit the
-  // 31-byte limit (NimBLE moves the name there when scan response is enabled).
+  /* The 128-bit service UUID goes in the advertisement (required for the client's
+     service-filtered scan); the name rides in the scan response so both fit the
+     31-byte limit (NimBLE moves the name there when scan response is enabled). */
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(NUS_SERVICE_UUID);
   adv->setName(BLE_DEVICE_NAME);
@@ -2353,15 +2295,13 @@ static void bleSend(const uint8_t *buf, size_t len) {
 
 #endif // ENABLE_BLE
 
-// ===========================================================================
-//                  TRANSPORT — unified front-end (master arbitration)
-// ===========================================================================
+/* ==== TRANSPORT — unified front-end (master arbitration) ================ */
 
 // Make `who` the single board master, evicting the other transport's holder.
 static void claimMaster(ActiveTransport who) {
-  // Courtesy notice to the outgoing (cross-transport) master before we drop it.
-  // sendFrame() still routes to the *old* master here (activeTransport not yet
-  // updated). Best-effort; a small delay lets a BLE notify flush before disconnect.
+  /* Courtesy notice to the outgoing (cross-transport) master before we drop it.
+     sendFrame() still routes to the *old* master here (activeTransport not yet
+     updated). Best-effort; a small delay lets a BLE notify flush before disconnect. */
   if (activeTransport != TR_NONE && activeTransport != who) {
     uint8_t nb[24];
     sendFrame(nb, buildEvictionFrame(nb));
@@ -2386,9 +2326,9 @@ static void transportInit() {
 #endif
 }
 
-// Firmata over USB serial (UART0 — the log console port). The first byte a host
-// sends claims the session: the console goes quiet and serial stays master until
-// another transport claims it or the board reboots (there is no disconnect event).
+/* Firmata over USB serial (UART0 — the log console port). The first byte a host
+   sends claims the session: the console goes quiet and serial stays master until
+   another transport claims it or the board reboots (there is no disconnect event). */
 static void serialPoll() {
   int guard = 0;
   while (Serial.available() && guard < 1024) {
@@ -2426,9 +2366,7 @@ static void sendFrame(const uint8_t *buf, size_t len) {
 
 static bool transportConnected() { return activeTransport != TR_NONE; }
 
-// ===========================================================================
-//  Arduino entry points
-// ===========================================================================
+/* ==== Arduino entry points ============================================== */
 void setup() {
   Serial.begin(115200);
   delay(200);
