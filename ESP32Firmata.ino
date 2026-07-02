@@ -78,7 +78,8 @@
 //  Transport-specific includes
 // ===========================================================================
 #if ENABLE_WIFI
-  #include <WiFi.h>
+  #include <esp_log.h>
+#include <WiFi.h>
   #include <ESPmDNS.h>
   #include <HTTPClient.h>          // internet actions (scheduler extension)
   #include <WiFiClientSecure.h>    // HTTPS (TLS via ssl_client / mbedTLS)
@@ -336,14 +337,23 @@ static const int HTTP_PARSE_MAX = 4096;
 // ===========================================================================
 // Exactly one transport "owns" the board at a time. A new connection on either
 // transport calls claimMaster(), which evicts the other transport's holder.
-enum ActiveTransport : uint8_t { TR_NONE = 0, TR_TCP, TR_BLE };
+enum ActiveTransport : uint8_t { TR_NONE = 0, TR_TCP, TR_BLE, TR_SERIAL };
 static ActiveTransport activeTransport = TR_NONE;
+
+// Console logging is gated: once a host starts speaking Firmata over USB serial,
+// log lines would corrupt the binary stream, so the serial claim silences both
+// our own prints and the IDF runtime logs for the rest of the session.
+static bool consoleQuiet = false;
+#define LOGP(...)  do { if (!consoleQuiet) Serial.print(__VA_ARGS__);   } while (0)
+#define LOGLN(...) do { if (!consoleQuiet) Serial.println(__VA_ARGS__); } while (0)
+#define LOGF(...)  do { if (!consoleQuiet) Serial.printf(__VA_ARGS__);  } while (0)
 
 // ===========================================================================
 //  Forward declarations
 // ===========================================================================
 static void transportInit();
 static void transportPoll();
+static void serialPoll();
 static void sendFrame(const uint8_t *buf, size_t len);
 static bool transportConnected();
 static void onNewConnection();
@@ -688,7 +698,7 @@ class FirmataProtocol {
       uint16_t cp = (data[i] & 0x7F) | ((data[i + 1] & 0x7F) << 7);
       if (cp < 128) s += (char)cp;
     }
-    Serial.print("[host] "); Serial.println(s);
+    LOGP("[host] "); LOGLN(s);
   }
 
   void processSysex(const uint8_t *buf, int len);   // defined after Scheduler
@@ -1927,14 +1937,14 @@ static bool       wifiReady = false;
 static void startBonjour() {
   MDNS.end();
   if (!MDNS.begin(MDNS_HOSTNAME)) {
-    Serial.println("mDNS start failed");
+    LOGLN("mDNS start failed");
     return;
   }
   MDNS.addService("firmata", "tcp", FIRMATA_TCP_PORT);   // -> _firmata._tcp
   String ip = WiFi.localIP().toString();
   MDNS.addServiceTxt("firmata", "tcp", "ip",   ip.c_str());
   MDNS.addServiceTxt("firmata", "tcp", "port", String(FIRMATA_TCP_PORT).c_str());
-  Serial.printf("Bonjour: _firmata._tcp on %s:%d (instance \"%s\")\n",
+  LOGF("Bonjour: _firmata._tcp on %s:%d (instance \"%s\")\n",
                 ip.c_str(), FIRMATA_TCP_PORT, MDNS_HOSTNAME);
 }
 
@@ -1943,8 +1953,8 @@ static void startTcpServices() {
   tcpServer.begin();
   tcpServer.setNoDelay(true);
   wifiReady = true;
-  Serial.print("Wi-Fi up. IP = ");
-  Serial.println(WiFi.localIP());
+  LOGP("Wi-Fi up. IP = ");
+  LOGLN(WiFi.localIP());
 }
 
 // ===========================================================================
@@ -2144,18 +2154,18 @@ static void tcpInit() {
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.begin(g_ssid.c_str(), g_pass.c_str());
-  Serial.printf("Connecting to Wi-Fi \"%s\"", g_ssid.c_str());
+  LOGF("Connecting to Wi-Fi \"%s\"", g_ssid.c_str());
   uint8_t tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 40) {   // ~16 s, non-fatal
     delay(400);
-    Serial.print('.');
+    LOGP('.');
     tries++;
   }
-  Serial.println();
+  LOGLN();
   if (WiFi.status() == WL_CONNECTED) {
     startTcpServices();
   } else {
-    Serial.println("Wi-Fi not up yet; continuing (BLE still available, will retry).");
+    LOGLN("Wi-Fi not up yet; continuing (BLE still available, will retry).");
   }
 }
 
@@ -2163,7 +2173,7 @@ static void tcpInit() {
 static void tcpDrop() {
   if (tcpClient && tcpClient.connected()) {
     tcpClient.stop();
-    Serial.println("Evicted TCP client (latest-wins)");
+    LOGLN("Evicted TCP client (latest-wins)");
   }
 }
 
@@ -2174,7 +2184,7 @@ static void tcpSend(const uint8_t *buf, size_t len) {
 static void tcpPoll() {
   // Track Wi-Fi up/down without blocking (the stack auto-reconnects).
   if (WiFi.status() != WL_CONNECTED) {
-    if (wifiReady) { wifiReady = false; Serial.println("Wi-Fi lost"); }
+    if (wifiReady) { wifiReady = false; LOGLN("Wi-Fi lost"); }
     return;
   }
   if (!wifiReady) startTcpServices();   // (re)connected — (re)start services
@@ -2190,7 +2200,7 @@ static void tcpPoll() {
     }
     tcpClient = incoming;
     tcpClient.setNoDelay(true);
-    Serial.println("TCP client connected");
+    LOGLN("TCP client connected");
     claimMaster(TR_TCP);
   }
   // Release mastership if our client went away.
@@ -2301,14 +2311,14 @@ static void bleInit() {
   adv->setName(BLE_DEVICE_NAME);
   adv->enableScanResponse(true);
   NimBLEDevice::startAdvertising();
-  Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
+  LOGF("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 }
 
 // Drop the current BLE central (used when another transport takes the board).
 static void bleDrop() {
   if (bleConnected && bleServer) {
     bleServer->disconnect(bleConnId);
-    Serial.println("Evicted BLE central (latest-wins)");
+    LOGLN("Evicted BLE central (latest-wins)");
   }
 }
 
@@ -2316,12 +2326,12 @@ static void blePoll() {
   if (bleNewConnect) {
     bleNewConnect = false;
     bleWasConnected = true;
-    Serial.println("BLE central connected");
+    LOGLN("BLE central connected");
     claimMaster(TR_BLE);
   } else if (!bleConnected && bleWasConnected) {
     bleWasConnected = false;
     if (activeTransport == TR_BLE) activeTransport = TR_NONE;
-    Serial.println("BLE central disconnected");
+    LOGLN("BLE central disconnected");
   }
   int b;
   int guard = 0;
@@ -2376,6 +2386,24 @@ static void transportInit() {
 #endif
 }
 
+// Firmata over USB serial (UART0 — the log console port). The first byte a host
+// sends claims the session: the console goes quiet and serial stays master until
+// another transport claims it or the board reboots (there is no disconnect event).
+static void serialPoll() {
+  int guard = 0;
+  while (Serial.available() && guard < 1024) {
+    int b = Serial.read();
+    if (b < 0) break;
+    if (activeTransport != TR_SERIAL) {
+      consoleQuiet = true;
+      esp_log_level_set("*", ESP_LOG_NONE);
+      claimMaster(TR_SERIAL);
+    }
+    liveHandler.process((uint8_t)b);
+    guard++;
+  }
+}
+
 static void transportPoll() {
 #if ENABLE_WIFI
   tcpPoll();
@@ -2383,6 +2411,7 @@ static void transportPoll() {
 #if ENABLE_BLE
   blePoll();
 #endif
+  serialPoll();
 }
 
 static void sendFrame(const uint8_t *buf, size_t len) {
@@ -2392,6 +2421,7 @@ static void sendFrame(const uint8_t *buf, size_t len) {
 #if ENABLE_BLE
   if (activeTransport == TR_BLE) { bleSend(buf, len); return; }
 #endif
+  if (activeTransport == TR_SERIAL) { Serial.write(buf, len); return; }
 }
 
 static bool transportConnected() { return activeTransport != TR_NONE; }
@@ -2402,8 +2432,8 @@ static bool transportConnected() { return activeTransport != TR_NONE; }
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println();
-  Serial.printf("=== ESP32 Firmata: %s ===\n", FIRMWARE_NAME);
+  LOGLN();
+  LOGF("=== ESP32 Firmata: %s ===\n", FIRMWARE_NAME);
 
   analogReadResolution(12);
 #if defined(ADC_11db)
