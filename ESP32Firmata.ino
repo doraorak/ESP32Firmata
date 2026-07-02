@@ -854,10 +854,16 @@ class Scheduler {
     sendFrame(b, 5);
   }
 
+  // Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
+  // client recorder's addTask/deleteTask — a task spawning tasks). They arrive
+  // here through the replay handler exactly like host messages. The one hazard is
+  // a task deleting then re-creating its OWN id mid-run: never hand out the
+  // instance currently being replayed (`running`), whose data/pos execute() is
+  // iterating.
   void create(uint8_t id, uint16_t len) {
     if (find(id) || len > MAX_TASK_BYTES) { sendError(id); return; }
     for (uint8_t i = 0; i < MAX_TASKS; i++) {
-      if (!tasks[i].used) {
+      if (!tasks[i].used && &tasks[i] != running) {
         tasks[i].used = true; tasks[i].id = id;
         tasks[i].time_ms = 0; tasks[i].len = len; tasks[i].pos = 0;
         return;
