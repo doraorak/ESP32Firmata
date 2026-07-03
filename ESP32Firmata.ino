@@ -94,6 +94,7 @@ static const uint8_t I2C_REQUEST             = 0x76;
 static const uint8_t I2C_REPLY               = 0x77;
 static const uint8_t I2C_CONFIG              = 0x78;
 static const uint8_t REPORT_FIRMWARE         = 0x79;
+static const uint8_t SERVO_CONFIG            = 0x70;
 static const uint8_t SAMPLING_INTERVAL       = 0x7A;
 static const uint8_t SCHEDULER_DATA          = 0x7B;
 
@@ -110,6 +111,7 @@ static const uint8_t SCHED_ERROR_REPLY     = 0x08;
 static const uint8_t SCHED_QUERY_ALL_REPLY = 0x09;
 static const uint8_t SCHED_QUERY_REPLY     = 0x0A;
 static const uint8_t SCHED_EXT_HTTP_REPLY  = 0x0B;   // device -> host: HTTP status + body
+static const uint8_t SCHED_REG_REPLY       = 0x0C;   // device -> host: R0-15 + F0-7 snapshot
 
 /* --- Logic extension (see NONSTANDARD.md) -----------------------------------
    On-device registers + if/else so a stored task can make decisions by itself.
@@ -150,6 +152,7 @@ static const uint8_t SCHED_EXT_STR_SET_SLOT    = 0x2D;  // set a snapshot slot's
 static const uint8_t SCHED_EXT_STR_COPY_SLOT   = 0x2E;  // copy one snapshot slot's content into another
 static const uint8_t SCHED_EXT_I2C_READ        = 0x2F;  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
 static const uint8_t SCHED_EXT_EMIT_STRING     = 0x30;  // device -> host: send a STRING_DATA frame to the master
+static const uint8_t SCHED_EXT_REG_QUERY       = 0x31;  // report all registers to the host (SCHED_REG_REPLY)
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -179,6 +182,7 @@ static const uint8_t PIN_MODE_INPUT  = 0x00;
 static const uint8_t PIN_MODE_OUTPUT = 0x01;
 static const uint8_t PIN_MODE_ANALOG = 0x02;
 static const uint8_t PIN_MODE_PWM    = 0x03;
+static const uint8_t PIN_MODE_SERVO  = 0x04;
 static const uint8_t PIN_MODE_I2C    = 0x06;
 static const uint8_t PIN_MODE_PULLUP = 0x0B;
 
@@ -288,6 +292,10 @@ static const uint8_t NUM_FLOAT_REGS = 8;     // F0..F7 (logic extension)
 static const int     NUM_SNAP       = 12;    // 2 JSON snapshot slots (0–1) + 10 string slots (2–11)
 
 // Scratch buffer used to build outgoing frames.
+/* Servo pulse range per pin (SERVO_CONFIG overrides the 544-2400 us defaults). */
+static int32_t servoMinUs[40];
+static int32_t servoMaxUs[40];
+
 static uint8_t   frameBuf[2048];
 // Max response bytes retained for JSON/string inspection AND echoed to a host.
 static const int HTTP_PARSE_MAX = 4096;
@@ -365,6 +373,7 @@ static void sendCapabilityResponse() {
       frameBuf[n++] = PIN_MODE_PULLUP; frameBuf[n++] = 1;
       frameBuf[n++] = PIN_MODE_OUTPUT; frameBuf[n++] = 1;
       frameBuf[n++] = PIN_MODE_PWM;    frameBuf[n++] = 8;
+      frameBuf[n++] = PIN_MODE_SERVO;  frameBuf[n++] = 14;
       if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) {
         frameBuf[n++] = PIN_MODE_I2C;  frameBuf[n++] = 1;
       }
@@ -492,8 +501,28 @@ class FirmataProtocol {
   ParserState ps;
   Scheduler*  sched = nullptr;        // wired once at startup (see setup)
 
+  /* Servo value semantics (standard Firmata): < 544 is an angle in degrees
+     (0-180 mapped onto the pin's pulse range); >= 544 is a raw pulse width in us.
+     LEDC at 50 Hz / 14-bit: duty = us * 2^14 / 20000. */
+  void servoOut(uint8_t pin, int value) {
+    int32_t us;
+    if (value < 544) {
+      int32_t a = value < 0 ? 0 : (value > 180 ? 180 : value);
+      us = servoMinUs[pin] + (servoMaxUs[pin] - servoMinUs[pin]) * a / 180;
+    } else {
+      us = value;
+      if (us < servoMinUs[pin]) us = servoMinUs[pin];
+      if (us > servoMaxUs[pin]) us = servoMaxUs[pin];
+    }
+    uint32_t duty = (uint32_t)((uint64_t)us * 16384u / 20000u);
+    if (duty > 16383u) duty = 16383u;
+    ledcWrite(pin, duty);
+    pinValues[pin] = us;
+  }
+
   void handleSetPinMode(uint8_t pin, uint8_t mode) {
     if (pin >= TOTAL_PINS) return;
+    if (pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO) ledcDetach(pin);
     switch (mode) {
       case PIN_MODE_INPUT:
         if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
@@ -510,12 +539,30 @@ class FirmataProtocol {
       case PIN_MODE_PWM:
         if (isFullDigital(pin)) { pinModes[pin] = mode; analogWrite(pin, 0); pinValues[pin] = 0; }
         break;
+      case PIN_MODE_SERVO:
+        if (isFullDigital(pin)) {
+          ledcAttach(pin, 50, 14);
+          pinModes[pin] = mode; pinValues[pin] = 0; pinConfigured[pin] = true;
+        }
+        break;
       case PIN_MODE_I2C:
         pinModes[pin] = mode;
         break;
       default:
         break;
     }
+  }
+
+  /* SERVO_CONFIG (0x70): pin, minPulse (14-bit LE), maxPulse (14-bit LE). Sets the
+     pulse range and puts the pin in servo mode (standard Firmata behaviour). */
+  void handleServoConfig(const uint8_t *data, int len) {
+    if (len < 5) return;
+    uint8_t pin = data[0];
+    if (pin >= TOTAL_PINS || !isFullDigital(pin)) return;
+    int32_t mn = (int32_t)(data[1] & 0x7F) | ((int32_t)(data[2] & 0x7F) << 7);
+    int32_t mx = (int32_t)(data[3] & 0x7F) | ((int32_t)(data[4] & 0x7F) << 7);
+    if (mn > 0 && mx > mn) { servoMinUs[pin] = mn; servoMaxUs[pin] = mx; }
+    handleSetPinMode(pin, PIN_MODE_SERVO);
   }
 
   void handleSetDigitalPinValue(uint8_t pin, uint8_t value) {
@@ -547,6 +594,8 @@ class FirmataProtocol {
     if (pinModes[pin] == PIN_MODE_PWM) {
       analogWrite(pin, value > 255 ? 255 : value);
       pinValues[pin] = value;
+    } else if (pinModes[pin] == PIN_MODE_SERVO) {
+      servoOut(pin, value);
     }
   }
 
@@ -587,6 +636,8 @@ class FirmataProtocol {
     if (pinModes[pin] == PIN_MODE_PWM) {
       analogWrite(pin, value > 255 ? 255 : value);
       pinValues[pin] = value;
+    } else if (pinModes[pin] == PIN_MODE_SERVO) {
+      servoOut(pin, value);
     }
   }
 
@@ -1499,6 +1550,26 @@ class Scheduler {
 
   // 0x30: send a STRING_DATA frame (board -> host) so a running task can report a message
   //       to a connected master (TCP or BLE). No-op if nobody is connected.
+  /* 0x31: report every register to the connected host as SCHED_REG_REPLY —
+     16 Int32s then 8 float bit-patterns, each as 5 little-endian 7-bit limbs.
+     Works live (host polls shared state) or from inside a task. */
+  void regReport() {
+    int n = 0;
+    frameBuf[n++] = START_SYSEX;
+    frameBuf[n++] = SCHEDULER_DATA;
+    frameBuf[n++] = SCHED_REG_REPLY;
+    for (uint8_t i = 0; i < NUM_SCHED_REGS; i++) {
+      uint32_t v = (uint32_t)regs[i];
+      for (uint8_t k = 0; k < 5; k++) { frameBuf[n++] = v & 0x7F; v >>= 7; }
+    }
+    for (uint8_t i = 0; i < NUM_FLOAT_REGS; i++) {
+      uint32_t v; memcpy(&v, &fregs[i], 4);
+      for (uint8_t k = 0; k < 5; k++) { frameBuf[n++] = v & 0x7F; v >>= 7; }
+    }
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+  }
+
   void doEmitString(const uint8_t *p, int plen) {
     if (plen < 3) return;
     int sLen = p[1] | (p[2] << 7);
@@ -1682,6 +1753,9 @@ class Scheduler {
       case SCHED_EXT_EMIT_STRING:       // 0x30 lenLo lenHi bytes…
         doEmitString(payload, plen);
         break;
+      case SCHED_EXT_REG_QUERY:         // 0x31: snapshot R0-15 + F0-7 to the host
+        regReport();
+        break;
     }
   }
 
@@ -1775,6 +1849,7 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
       }
       break;
     case STRING_DATA:           handleString(data, dlen);    break;
+    case SERVO_CONFIG:          handleServoConfig(data, dlen); break;
     case I2C_CONFIG:            handleI2CConfig(data, dlen);  break;
     case I2C_REQUEST:           handleI2CRequest(data, dlen); break;
     case SCHEDULER_DATA:        sched->handleSysex(data, dlen); break;
@@ -2368,6 +2443,7 @@ static bool transportConnected() { return activeTransport != TR_NONE; }
 
 /* ==== Arduino entry points ============================================== */
 void setup() {
+  for (uint8_t i = 0; i < TOTAL_PINS; i++) { servoMinUs[i] = 544; servoMaxUs[i] = 2400; }
   Serial.begin(115200);
   delay(200);
   LOGLN();
