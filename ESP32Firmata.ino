@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     8
+#define FIRMWARE_MINOR     9
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -153,6 +153,8 @@ static const uint8_t SCHED_EXT_STR_COPY_SLOT   = 0x2E;  // copy one snapshot slo
 static const uint8_t SCHED_EXT_I2C_READ        = 0x2F;  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
 static const uint8_t SCHED_EXT_EMIT_STRING     = 0x30;  // device -> host: send a STRING_DATA frame to the master
 static const uint8_t SCHED_EXT_REG_QUERY       = 0x31;  // report all registers to the host (SCHED_REG_REPLY)
+static const uint8_t SCHED_EXT_WRITE_PIN       = 0x32;  // write a pin from an operand: kind(0=digital,1=analog) pin <operand>
+static const uint8_t SCHED_EXT_MODULE_OP       = 0x33;  // deliver a payload to a module from a task
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -168,6 +170,9 @@ static const int32_t ST_ALLOC_FAILED  = 5;
    via an ephemeral X25519 ECDH handshake (HKDF-SHA256 -> AES-256-GCM), so a
    passive sniffer never sees the password. Provisioned creds persist in NVS and
    override the compile-time WIFI_SSID/WIFI_PASS on the next boot. */
+static const uint8_t MODULE_DATA       = 0x0D;  // module subsystem (user-range SysEx)
+static const uint8_t MODULE_QUERY      = 0x00;
+static const uint8_t MODULE_LIST_REPLY = 0x7F;
 static const uint8_t WIFI_CONFIG = 0x0C;
 static const uint8_t WC_SET    = 0x00;  // host->dev: <clientPub><nonce><ct+tag>  (set + connect + save)
 static const uint8_t WC_FORGET = 0x01;  // host->dev: clear stored creds
@@ -1550,6 +1555,32 @@ class Scheduler {
 
   // 0x30: send a STRING_DATA frame (board -> host) so a running task can report a message
   //       to a connected master (TCP or BLE). No-op if nobody is connected.
+  /* 0x32: write a pin from an OPERAND (register or literal) — task values drive
+     outputs: kind 0 = digital (non-zero -> HIGH, OUTPUT pins only), kind 1 =
+     analog, routed by the pin's mode (PWM duty or servo degrees/us). */
+  void writePinOp(const uint8_t *payload, int plen) {
+    if (plen < 4) return;
+    uint8_t kind = payload[1];
+    uint8_t pin = payload[2] & 0x7F;
+    if (pin >= TOTAL_PINS) return;
+    int i = 3;
+    Operand v = readOperand(payload, plen, i);
+    int value = (int)(v.isFloat ? f2i(v.f) : v.i);
+    if (kind == 0) {
+      if (pinModes[pin] == PIN_MODE_OUTPUT) {
+        digitalWrite(pin, value != 0 ? HIGH : LOW);
+        pinValues[pin] = value != 0 ? 1 : 0;
+      }
+    } else {
+      if (pinModes[pin] == PIN_MODE_PWM) {
+        analogWrite(pin, value > 255 ? 255 : (value < 0 ? 0 : value));
+        pinValues[pin] = value;
+      } else if (pinModes[pin] == PIN_MODE_SERVO) {
+        replay->servoOut(pin, value);
+      }
+    }
+  }
+
   /* 0x31: report every register to the connected host as SCHED_REG_REPLY —
      16 Int32s then 8 float bit-patterns, each as 5 little-endian 7-bit limbs.
      Works live (host polls shared state) or from inside a task. */
@@ -1756,6 +1787,12 @@ class Scheduler {
       case SCHED_EXT_REG_QUERY:         // 0x31: snapshot R0-15 + F0-7 to the host
         regReport();
         break;
+      case SCHED_EXT_WRITE_PIN:         // 0x32 kind pin <operand>
+        writePinOp(payload, plen);
+        break;
+      case SCHED_EXT_MODULE_OP:         // 0x33 <moduleId> <payload…>
+        if (plen >= 2) moduleDispatch(payload[1], payload + 2, plen - 2);
+        break;
     }
   }
 
@@ -1835,6 +1872,7 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
 
   switch (cmd) {
 #if ENABLE_WIFI
+    case MODULE_DATA:           handleModuleData(data, dlen);  break;
     case WIFI_CONFIG:           handleWiFiConfig(data, dlen);  break;
 #endif
     case REPORT_FIRMWARE:       sendFirmwareReport();        break;
@@ -2442,6 +2480,151 @@ static void sendFrame(const uint8_t *buf, size_t len) {
 static bool transportConnected() { return activeTransport != TR_NONE; }
 
 /* ==== Arduino entry points ============================================== */
+/* ==== Module subsystem ====================================================
+   Compile-time firmware plugins behind one reserved SysEx (MODULE_DATA 0x0D)
+   and one task ext op (MODULE_OP 0x33) — byte-identical to ESP32FirmataSwift.
+   Modules put results in the scheduler registers, which plugs them into
+   ifTrue/tasks for free. */
+
+static const uint8_t IR_MODULE_ID = 0x01;
+
+struct ModuleEntry { uint8_t id, major, minor; const char *name; };
+static const ModuleEntry moduleTable[] = {
+  { IR_MODULE_ID, 1, 0, "ir" },
+};
+static const uint8_t MODULE_COUNT = sizeof(moduleTable) / sizeof(moduleTable[0]);
+
+static void irHandle(const uint8_t *p, int n);
+static void irTick();
+
+static void moduleDispatch(uint8_t id, const uint8_t *payload, int n) {
+  switch (id) {
+    case IR_MODULE_ID: irHandle(payload, n); break;
+    default: break;
+  }
+}
+
+static void moduleTick() { irTick(); }
+
+static void handleModuleData(const uint8_t *data, int dlen) {
+  if (dlen < 1) return;
+  if (data[0] == MODULE_QUERY) {
+    int n = 0;
+    frameBuf[n++] = START_SYSEX;
+    frameBuf[n++] = MODULE_DATA;
+    frameBuf[n++] = MODULE_LIST_REPLY;
+    frameBuf[n++] = MODULE_COUNT;
+    for (uint8_t m = 0; m < MODULE_COUNT; m++) {
+      frameBuf[n++] = moduleTable[m].id;
+      frameBuf[n++] = moduleTable[m].major;
+      frameBuf[n++] = moduleTable[m].minor;
+      uint8_t len = (uint8_t)strlen(moduleTable[m].name);
+      frameBuf[n++] = len;
+      for (uint8_t k = 0; k < len; k++) frameBuf[n++] = moduleTable[m].name[k] & 0x7F;
+    }
+    frameBuf[n++] = END_SYSEX;
+    sendFrame(frameBuf, n);
+    return;
+  }
+  moduleDispatch(data[0], data + 1, dlen - 1);
+}
+
+/* ==== IR module (NEC over RMT) ============================================
+   ops: 0x00 <pin> = configure TX (38 kHz carrier); 0x01 <code:5 limbs> = send
+   a 32-bit NEC frame (MSB-first code); 0x02 <pin> <dstReg> = start RX — each
+   decoded frame lands in R[dstReg] and is pushed to the host as event 0x03. */
+
+static int      irTxPin = -1;
+static int      irRxPin = -1;
+static int      irDstReg = 0;
+static rmt_data_t irRxSyms[96];
+static size_t   irRxLen = 0;
+static bool     irRxArmed = false;
+
+// Raw send: p = [0x03, carrierKHz, dur0Lo,dur0Hi, dur1Lo,dur1Hi, ...]. Durations are
+// alternating mark/space (µs, 14-bit LE). Marks HIGH; carrierKHz 0 = no carrier.
+static void irSendRaw(const uint8_t *p, int n) {
+  if (irTxPin < 0 || n < 4) return;
+  uint32_t khz = p[1] & 0x7F;
+  rmtSetCarrier(irTxPin, khz > 0, false, khz * 1000, 0.33f);
+  static rmt_data_t sym[64];
+  int cnt = 0, k = 2;
+  while (k + 1 < n && cnt < 64) {
+    uint32_t d0 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2;
+    uint32_t d1 = 1;
+    if (k + 1 < n) { d1 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2; }
+    sym[cnt].level0 = 1; sym[cnt].duration0 = d0 ? d0 : 1;
+    sym[cnt].level1 = 0; sym[cnt].duration1 = d1 ? d1 : 1;
+    cnt++;
+  }
+  rmtWrite(irTxPin, sym, cnt, 200);
+}
+
+static void irHandle(const uint8_t *p, int n) {
+  if (n < 1) return;
+  switch (p[0]) {
+    case 0x00:
+      // Configure the TX pin. The carrier is set per send by the raw op (0x03).
+      if (n >= 2 && rmtInit(p[1] & 0x7F, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 1000000))
+        irTxPin = p[1] & 0x7F;
+      break;
+    case 0x03:
+      irSendRaw(p, n);   // raw mark/space replay (NEC, RC6, any protocol encoded host-side)
+      break;
+    case 0x02:
+      if (n >= 3 && rmtInit(p[1] & 0x7F, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) {
+        irRxPin = p[1] & 0x7F;
+        irDstReg = p[2] & 0x0F;
+        rmtSetRxMaxThreshold(irRxPin, 12000);
+        // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us),
+        // NOT the 1 MHz resolution clock. Larger values make rmt_receive() reject the config
+        // and reception silently never starts. 2 us is safely under the limit.
+        rmtSetRxMinThreshold(irRxPin, 2);
+        irRxLen = sizeof(irRxSyms) / sizeof(irRxSyms[0]);
+        irRxArmed = rmtReadAsync(irRxPin, irRxSyms, &irRxLen);
+      }
+      break;
+    default: break;
+  }
+}
+
+static bool irNear(int32_t v, int32_t target) {
+  return v > target - target / 4 && v < target + target / 4;
+}
+
+static void irTick() {
+  if (irRxPin < 0 || !irRxArmed || !rmtReceiveCompleted(irRxPin)) return;
+  static int32_t d[192];
+  int n = 0;
+  for (size_t i = 0; i < irRxLen && n + 1 < 192; i++) {
+    d[n++] = (int32_t)irRxSyms[i].duration0;
+    d[n++] = (int32_t)irRxSyms[i].duration1;
+  }
+  irRxLen = sizeof(irRxSyms) / sizeof(irRxSyms[0]);
+  irRxArmed = rmtReadAsync(irRxPin, irRxSyms, &irRxLen);
+  if (n < 66) return;
+  int i = 0;
+  while (i + 1 < n && !(irNear(d[i], 9000) && irNear(d[i + 1], 4500))) i++;
+  if (i + 66 > n) return;
+  i += 2;
+  uint32_t code = 0;
+  for (int k = 0; k < 32; k++) {
+    if (!irNear(d[i], 562)) return;
+    if (irNear(d[i + 1], 1687)) code = (code << 1) | 1;
+    else if (irNear(d[i + 1], 562)) code = code << 1;
+    else return;
+    i += 2;
+  }
+  scheduler.regs[irDstReg] = (int32_t)code;
+  uint8_t out[10];
+  int m = 0;
+  out[m++] = START_SYSEX; out[m++] = MODULE_DATA; out[m++] = IR_MODULE_ID; out[m++] = 0x03;
+  uint32_t v = code;
+  for (int k = 0; k < 5; k++) { out[m++] = v & 0x7F; v >>= 7; }
+  out[m++] = END_SYSEX;
+  sendFrame(out, m);
+}
+
 void setup() {
   for (uint8_t i = 0; i < TOTAL_PINS; i++) { servoMinUs[i] = 544; servoMaxUs[i] = 2400; }
   Serial.begin(115200);
@@ -2465,6 +2648,7 @@ void setup() {
 
 void loop() {
   transportPoll();
+  moduleTick();
 
   // Scheduler runs whether or not a client is connected — that is the whole
   // point: queue a task, disconnect, and the board keeps executing it.

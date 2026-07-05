@@ -79,6 +79,27 @@ The byte-level spec for all ext ops (`0x10–0x30`) lives in the
 [SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient) and its
 [COOKBOOK](https://github.com/doraorak/SwiftFirmataClient/blob/main/COOKBOOK.md).
 
+## Modules (2.9+)
+
+Compile-time plugins behind one reserved SysEx, **`MODULE_DATA` (`0x0D`)**, each in the
+firmware's own language — native C++ here. Wire:
+
+- `F0 0D 00 F7` — **query**; reply `F0 0D 7F <n> [<id> <maj> <min> <nameLen> <name…>]* F7`.
+- `F0 0D <id> <payload…> F7` — talk to module `<id>` (any `0x01–0x7E`); the payload is that
+  module's own protocol, both directions (modules push events the same way).
+- Task ext op `0x33 <id> <payload…>` — a scheduled task drives a module.
+
+The registry is a static `moduleTable` (id, version, name) + a dispatch switch + a per-loop
+`moduleTick()`; adding a module = one table row, a handler, and a tick.
+
+| ID | Module | Ver | Purpose |
+|----|--------|-----|---------|
+| `0x01` | `ir` | 1.0 | Infrared NEC/RC6 transmit + NEC receive over RMT |
+
+The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`); the
+host encodes NEC/RC6 (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR)). Drive
+the LED at 5 V, keep the receiver on 3.3 V.
+
 ## Pin map (typical ESP32 dev board)
 
 - Full digital (input/pullup/output/PWM): GPIO 0, 2, 4, 5, 12–19, 21–23, 25–27, 32, 33
