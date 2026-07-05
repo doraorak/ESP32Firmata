@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     10
+#define FIRMWARE_MINOR     11
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -2543,16 +2543,18 @@ static bool     irRxArmed = false;
 
 // Raw send: p = [0x03, carrierKHz, dur0Lo,dur0Hi, dur1Lo,dur1Hi, ...]. Durations are
 // alternating mark/space (µs, 14-bit LE). Marks HIGH; carrierKHz 0 = no carrier.
-static rmt_data_t irSym[64];       // staged frame (reused by op 0x03/0x04)
-static int        irSymCount = 0;
-static int        irTxRepeatLeft = 0;   // pending re-sends for a hold (op 0x04)
+static rmt_data_t irSym[80];       // staged frame(s): frame A, then optional frame B
+static int        irSymA = 0;      // symbols in frame A (B = irSym[irSymA..irSymTotal))
+static int        irSymTotal = 0;
+static int        irTxSendIdx = 0; // send # in a repeat run (even=A, odd=B: RC6 toggle)
+static int        irTxRepeatLeft = 0;
 static uint32_t   irTxGapMs = 0;
 static uint32_t   irTxNextMs = 0;
 
-// Stage 14-bit LE duration pairs from p[start...] into irSym.
-static void irStage(const uint8_t *p, int n, int start) {
+// Stage 14-bit LE duration pairs from p[start...] into irSym symbols; return the count.
+static int irStageSyms(const uint8_t *p, int n, int start) {
   int cnt = 0, k = start;
-  while (k + 1 < n && cnt < 64) {
+  while (k + 1 < n && cnt < 80) {
     uint32_t d0 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2;
     uint32_t d1 = 1;
     if (k + 1 < n) { d1 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2; }
@@ -2560,35 +2562,48 @@ static void irStage(const uint8_t *p, int n, int start) {
     irSym[cnt].level1 = 0; irSym[cnt].duration1 = d1 ? d1 : 1;
     cnt++;
   }
-  irSymCount = cnt;
+  return cnt;
 }
-static void irRawSend() { if (irSymCount > 0) rmtWrite(irTxPin, irSym, irSymCount, 200); }
-
+// Send frame A (even idx) or frame B (odd idx, when a distinct B exists — the RC6 toggle
+// variant). NEC/raw have no B → always A.
+static void irSendFrame(int idx) {
+  if (irSymA <= 0) return;
+  bool useB = (irSymTotal > irSymA) && (idx & 1);
+  int off = useB ? irSymA : 0;
+  int cnt = useB ? irSymTotal - irSymA : irSymA;
+  rmtWrite(irTxPin, irSym + off, cnt, 200);
+}
 // op 0x03: single raw send. p = [0x03, carrierKHz, dur pairs...].
 static void irSendRaw(const uint8_t *p, int n) {
   if (irTxPin < 0 || n < 4) return;
   uint32_t khz = p[1] & 0x7F;
   rmtSetCarrier(irTxPin, khz > 0, false, khz * 1000, 0.33f);
-  irTxRepeatLeft = 0;                 // cancel any pending hold
-  irStage(p, n, 2);
-  irRawSend();
+  irTxRepeatLeft = 0;                 // cancel any pending repeat
+  irSymTotal = irStageSyms(p, n, 2);
+  irSymA = irSymTotal;                // one frame, no B
+  irSendFrame(0);
 }
-// op 0x04: raw send with hold. p = [0x04, carrierKHz, repeat, gapLo, gapHi, dur pairs...].
-// Sends once now, then re-sends (repeat-1) more times, gapMs apart, from irTxTick (non-blocking).
-static void irSendRawHold(const uint8_t *p, int n) {
-  if (irTxPin < 0 || n < 6) return;
+// op 0x04: repeat/hold. p = [0x04, carrierKHz, repeat, gapLo, gapHi, nA_lo, nA_hi, A durs, B durs].
+// nA = durations in frame A (even); the rest are B (RC6 toggle variant). No B → repeats send A.
+static void irSendRepeat(const uint8_t *p, int n) {
+  if (irTxPin < 0 || n < 8) return;
   uint32_t khz = p[1] & 0x7F;
   rmtSetCarrier(irTxPin, khz > 0, false, khz * 1000, 0.33f);
   int rep = p[2] & 0x7F;
   irTxGapMs = (uint32_t)(p[3] & 0x7F) | ((uint32_t)(p[4] & 0x7F) << 7);
-  irStage(p, n, 5);
-  irRawSend();
+  int nA = (int)(p[5] & 0x7F) | ((int)(p[6] & 0x7F) << 7);   // durations in A (even)
+  irSymTotal = irStageSyms(p, n, 7);
+  int aSyms = nA / 2;
+  irSymA = (aSyms > 0 && aSyms < irSymTotal) ? aSyms : irSymTotal;
+  irSendFrame(0);
+  irTxSendIdx = 1;
   irTxRepeatLeft = rep > 1 ? rep - 1 : 0;
   irTxNextMs = millis() + irTxGapMs;
 }
 static void irTxTick() {
   if (irTxRepeatLeft > 0 && irTxPin >= 0 && (int32_t)(millis() - irTxNextMs) >= 0) {
-    irRawSend();
+    irSendFrame(irTxSendIdx);
+    irTxSendIdx++;
     irTxRepeatLeft--;
     irTxNextMs = millis() + irTxGapMs;
   }
@@ -2606,7 +2621,7 @@ static void irHandle(const uint8_t *p, int n) {
       irSendRaw(p, n);   // raw mark/space replay (NEC, RC6, any protocol encoded host-side)
       break;
     case 0x04:
-      irSendRawHold(p, n);   // raw replay repeated (hold) — sends once, re-sends via irTxTick
+      irSendRepeat(p, n);   // repeat/hold — alternates A/B (RC6 toggle), re-sends via irTxTick
       break;
     case 0x02:
       if (n >= 3 && rmtInit(p[1] & 0x7F, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) {
