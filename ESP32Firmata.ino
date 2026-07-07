@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     11
+#define FIRMWARE_MINOR     15
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -155,6 +155,8 @@ static const uint8_t SCHED_EXT_EMIT_STRING     = 0x30;  // device -> host: send 
 static const uint8_t SCHED_EXT_REG_QUERY       = 0x31;  // report all registers to the host (SCHED_REG_REPLY)
 static const uint8_t SCHED_EXT_WRITE_PIN       = 0x32;  // write a pin from an operand: kind(0=digital,1=analog) pin <operand>
 static const uint8_t SCHED_EXT_MODULE_OP       = 0x33;  // deliver a payload to a module from a task
+static const uint8_t SCHED_EXT_LOOP            = 0x34;  // begin a counted loop: countLo countHi gapLo gapHi skipLo skipHi
+static const uint8_t SCHED_EXT_LOOP_END        = 0x35;  // end of a counted loop: decrement, jump back + gap, or exit
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -226,6 +228,7 @@ struct ParserState {
 // Scheduler task storage.
 static const uint8_t  MAX_TASKS      = 8;
 static const uint16_t MAX_TASK_BYTES = 512;
+static const uint8_t  MAX_LOOP_DEPTH = 4;   // per-task counted-loop nesting (SCHED_EXT_LOOP)
 
 struct SchedTask {
   bool     used = false;
@@ -234,6 +237,12 @@ struct SchedTask {
   uint16_t len = 0;       // bytes of task data stored
   uint16_t pos = 0;       // execution cursor
   uint8_t  data[MAX_TASK_BYTES];
+  // Counted-loop stack (SCHED_EXT_LOOP / _END): iterations left, gap ms, and the byte
+  // position to jump back to for each open loop. Persists across delay-suspends.
+  uint8_t  loopDepth = 0;
+  uint16_t loopRemaining[MAX_LOOP_DEPTH] = {0};
+  uint32_t loopGap[MAX_LOOP_DEPTH]       = {0};
+  uint16_t loopResume[MAX_LOOP_DEPTH]    = {0};
 };
 
 // Full digital pins: support INPUT / INPUT_PULLUP / OUTPUT / PWM.
@@ -292,8 +301,8 @@ static ContinuousRead contReads[MAX_CONT_READS];
 /* Non-standard scheduler registers: 16 global Int32s shared across tasks.
    (The Scheduler and FirmataProtocol classes, and their instances, are defined
     further down — after the send helpers they depend on.) */
-static const uint8_t NUM_SCHED_REGS = 16;
-static const uint8_t NUM_FLOAT_REGS = 8;     // F0..F7 (logic extension)
+static const uint8_t NUM_SCHED_REGS = 32;
+static const uint8_t NUM_FLOAT_REGS = 16;     // F0..F7 (logic extension)
 static const int     NUM_SNAP       = 12;    // 2 JSON snapshot slots (0–1) + 10 string slots (2–11)
 
 // Scratch buffer used to build outgoing frames.
@@ -905,6 +914,7 @@ class Scheduler {
     SchedTask *t = find(id);
     if (!t) { sendError(id); return; }
     t->pos = 0;
+    t->loopDepth = 0;
     t->time_ms = millis() + delayMs;
     if (t->time_ms == 0) t->time_ms = 1;        // reserve 0 for "not scheduled"
   }
@@ -976,7 +986,7 @@ class Scheduler {
     uint8_t type = payload[i++];
     switch (type) {
       case 0: {                                        // int register
-        int32_t v = (i < plen) ? regs[payload[i] & 0x0F] : 0; i++;
+        int32_t v = (i < plen) ? regs[payload[i] & 0x1F] : 0; i++;
         return { false, v, (float)v };
       }
       case 2: {                                        // float register
@@ -1001,6 +1011,30 @@ class Scheduler {
     if (!running) return;
     uint32_t p = (uint32_t)running->pos + amount;
     running->pos = (p > running->len) ? running->len : (uint16_t)p;
+  }
+
+  /* Counted loop (SCHED_EXT_LOOP / _END). LOOP pushes (iterations, gap, body-start pos);
+     LOOP_END decrements and either jumps back (gap ms apart, via the delay-suspend) or pops.
+     count == 0 or nesting past MAX_LOOP_DEPTH skips the body outright. */
+  void loopBegin(uint16_t count, uint32_t gap, uint16_t skipLen) {
+    if (!running) return;
+    if (count == 0 || running->loopDepth >= MAX_LOOP_DEPTH) { skip(skipLen); return; }
+    running->loopRemaining[running->loopDepth] = count;
+    running->loopGap[running->loopDepth]       = gap;
+    running->loopResume[running->loopDepth]    = running->pos;   // pos = start of the body
+    running->loopDepth++;
+  }
+
+  void loopEnd() {
+    if (!running || running->loopDepth == 0) return;
+    uint8_t d = running->loopDepth - 1;
+    running->loopRemaining[d]--;
+    if (running->loopRemaining[d] > 0) {
+      running->pos = running->loopResume[d];                     // jump back to the body
+      if (running->loopGap[d] > 0) delayRunning(running->loopGap[d]);  // pause between iterations
+    } else {
+      running->loopDepth--;                                      // loop finished: pop
+    }
   }
 
   // Send the last HTTP result (status + body) to the connected host.
@@ -1210,7 +1244,7 @@ class Scheduler {
   // 0x16: R[dst] = number at JSON <path> × 10^scale (truncated); R[found] = 0/1.
   void doJsonNum(const uint8_t *p, int plen) {
     if (plen < 6) return;
-    int dst = p[1] & 0x0F, foundReg = p[2] & 0x0F, scale = p[3];
+    int dst = p[1] & 0x1F, foundReg = p[2] & 0x1F, scale = p[3];
     int pathLen = p[4] | (p[5] << 7);
     if (6 + pathLen > plen) return;
     const uint8_t *path = p + 6;
@@ -1226,7 +1260,7 @@ class Scheduler {
   // 0x17 (eq) / 0x19 (contains): compare JSON string at <path> with <str>.
   void doJsonStr(const uint8_t *p, int plen, bool contains) {
     if (plen < 4) return;
-    int dst = p[1] & 0x0F;
+    int dst = p[1] & 0x1F;
     int pathLen = p[2] | (p[3] << 7);
     int i = 4 + pathLen;
     if (i + 2 > plen) return;
@@ -1249,7 +1283,7 @@ class Scheduler {
   // 0x18: R[dst] = whole body contains <str> ? 1 : 0.
   void doBodyContains(const uint8_t *p, int plen) {
     if (plen < 4) return;
-    int dst = p[1] & 0x0F;
+    int dst = p[1] & 0x1F;
     int strLen = p[2] | (p[3] << 7);
     if (4 + strLen > plen) return;
     const uint8_t *needle = p + 4;
@@ -1262,7 +1296,7 @@ class Scheduler {
   // 0x28: R[dst] = byte length of the selected body.
   void doStrBodyLen(const uint8_t *p, int plen) {
     if (plen < 2) return;
-    int dst = p[1] & 0x0F;
+    int dst = p[1] & 0x1F;
     regs[dst] = 0;
     int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
     if (stale) { lastStatus = ST_STALE; return; }
@@ -1272,7 +1306,7 @@ class Scheduler {
   // 0x29: R[dst] = (whole selected body == <str>) ? 1 : 0.
   void doStrEquals(const uint8_t *p, int plen) {
     if (plen < 4) return;
-    int dst = p[1] & 0x0F;
+    int dst = p[1] & 0x1F;
     int strLen = p[2] | (p[3] << 7);
     if (4 + strLen > plen) return;
     const uint8_t *needle = p + 4;
@@ -1285,7 +1319,7 @@ class Scheduler {
   // 0x2A: R[dst] = index of <str> in the selected body, or -1.
   void doStrIndexOf(const uint8_t *p, int plen) {
     if (plen < 4) return;
-    int dst = p[1] & 0x0F;
+    int dst = p[1] & 0x1F;
     int strLen = p[2] | (p[3] << 7);
     if (4 + strLen > plen) return;
     const uint8_t *needle = p + 4;
@@ -1306,7 +1340,7 @@ class Scheduler {
   // 0x2B: R[dst] = body parsed as a leading integer; R[found] = 0/1.
   void doStrToNum(const uint8_t *p, int plen) {
     if (plen < 3) return;
-    int dst = p[1] & 0x0F, foundReg = p[2] & 0x0F;
+    int dst = p[1] & 0x1F, foundReg = p[2] & 0x1F;
     regs[dst] = 0; regs[foundReg] = 0;
     int blen; bool stale; const uint8_t *b = inspectBuf(blen, stale);
     if (stale) { lastStatus = ST_STALE; return; }
@@ -1329,7 +1363,7 @@ class Scheduler {
   // 0x1D: F[dst] = json float at <path>; R[found] = 0/1.
   void doJsonFloat(const uint8_t *p, int plen) {
     if (plen < 5) return;
-    int dst = p[1] & (NUM_FLOAT_REGS - 1), foundReg = p[2] & 0x0F;
+    int dst = p[1] & (NUM_FLOAT_REGS - 1), foundReg = p[2] & 0x1F;
     int pathLen = p[3] | (p[4] << 7);
     if (5 + pathLen > plen) return;
     const uint8_t *path = p + 5;
@@ -1346,7 +1380,7 @@ class Scheduler {
   bool queryArgs(const uint8_t *p, int plen, int &dst,
                  const uint8_t *&b, int &blen, const uint8_t *&path, int &pathLen) {
     if (plen < 4) return false;
-    dst = p[1] & 0x0F;
+    dst = p[1] & 0x1F;
     pathLen = p[2] | (p[3] << 7);
     if (4 + pathLen > plen) return false;
     path = p + 4;
@@ -1391,7 +1425,7 @@ class Scheduler {
   // 0x1A: R[dst] = A <op> B (int; op 0+ 1- 2* 3/ 4%). 64-bit intermediates; ÷/%0 -> 0.
   void doArith(const uint8_t *p, int plen) {
     if (plen < 3) return;
-    uint8_t sub = p[1]; int dst = p[2] & 0x0F;
+    uint8_t sub = p[1]; int dst = p[2] & 0x1F;
     int i = 3;
     int32_t a = readOperand(p, plen, i).i;
     int32_t b = readOperand(p, plen, i).i;
@@ -1431,7 +1465,7 @@ class Scheduler {
   // 0x27: R[dst] = (A <op> B) ? 1 : 0 (same operand decoding + float promotion as IF).
   void doCmp(const uint8_t *p, int plen) {
     if (plen < 3) return;
-    uint8_t op = p[1]; int dst = p[2] & 0x0F;
+    uint8_t op = p[1]; int dst = p[2] & 0x1F;
     int i = 3;
     Operand a = readOperand(p, plen, i);
     Operand b = readOperand(p, plen, i);
@@ -1440,25 +1474,25 @@ class Scheduler {
   // 0x22: R[dst] = current request count (generation; ++ per HTTP request).
   void doReadRequestCount(const uint8_t *p, int plen) {
     if (plen < 2) return;
-    regs[p[1] & 0x0F] = requestCount;
+    regs[p[1] & 0x1F] = requestCount;
   }
   // 0x21: R[freeReg] = free heap, R[largestReg] = largest free block.
   void doHeap(const uint8_t *p, int plen) {
     if (plen < 3) return;
-    regs[p[1] & 0x0F] = (int32_t)ESP.getFreeHeap();
-    regs[p[2] & 0x0F] = (int32_t)ESP.getMaxAllocHeap();
+    regs[p[1] & 0x1F] = (int32_t)ESP.getFreeHeap();
+    regs[p[2] & 0x1F] = (int32_t)ESP.getMaxAllocHeap();
   }
   // 0x26: R[dst] = status of the last inspection op.
   void doLastStatus(const uint8_t *p, int plen) {
     if (plen < 2) return;
-    regs[p[1] & 0x0F] = lastStatus;
+    regs[p[1] & 0x1F] = lastStatus;
   }
   // 0x24: select inspection source — 0 = live body (stale if requestCount != R[expGenReg]),
   //       k = snapshot slot k-1 (always valid).
   void doSelect(const uint8_t *p, int plen) {
     if (plen < 3) return;
     inspectSel = p[1];
-    inspectStale = (inspectSel == 0) ? (requestCount != regs[p[2] & 0x0F]) : false;
+    inspectStale = (inspectSel == 0) ? (requestCount != regs[p[2] & 0x1F]) : false;
   }
   // 0x25: free snapshot slot <slot>.
   void doFree(const uint8_t *p, int plen) {
@@ -1542,7 +1576,7 @@ class Scheduler {
     uint16_t address = p[1] & 0x7F;
     int reg   = p[2] | (p[3] << 7);
     int count = p[4]; if (count < 1) count = 1; if (count > 4) count = 4;
-    int dst   = p[5] & 0x0F;
+    int dst   = p[5] & 0x1F;
     Wire.beginTransmission(address);
     Wire.write((uint8_t)reg);
     Wire.endTransmission();
@@ -1622,7 +1656,7 @@ class Scheduler {
   void doHttp(const uint8_t *p, int plen) {
     if (plen < 5) return;
     uint8_t method   = p[1];
-    int     statusReg = p[2] & 0x0F;
+    int     statusReg = p[2] & 0x1F;
     int     urlLen    = p[3] | (p[4] << 7);
     int i = 5;
     if (urlLen <= 0 || i + urlLen > plen) return;
@@ -1675,15 +1709,15 @@ class Scheduler {
   void handleExt(const uint8_t *payload, int plen) {
     switch (payload[0]) {
       case SCHED_EXT_SET:               // 0x10 reg <const:5>
-        if (plen == 7) regs[payload[1] & 0x0F] = (int32_t)sched7BitTime(payload + 2);
+        if (plen == 7) regs[payload[1] & 0x1F] = (int32_t)sched7BitTime(payload + 2);
         break;
       case SCHED_EXT_READ_DIGITAL:      // 0x11 reg pin
-        if (plen == 3) regs[payload[1] & 0x0F] = digitalRead(payload[2]) ? 1 : 0;
+        if (plen == 3) regs[payload[1] & 0x1F] = digitalRead(payload[2]) ? 1 : 0;
         break;
       case SCHED_EXT_READ_ANALOG: {     // 0x12 reg channel
         if (plen == 3) {
           int pin = pinOfAnalogChannel(payload[2]);
-          regs[payload[1] & 0x0F] = (pin >= 0) ? analogRead(pin) : 0;
+          regs[payload[1] & 0x1F] = (pin >= 0) ? analogRead(pin) : 0;
         }
         break;
       }
@@ -1793,6 +1827,17 @@ class Scheduler {
       case SCHED_EXT_MODULE_OP:         // 0x33 <moduleId> <payload…>
         if (plen >= 2) moduleDispatch(payload[1], payload + 2, plen - 2);
         break;
+      case SCHED_EXT_LOOP:              // 0x34 countLo countHi gapLo gapHi skipLo skipHi
+        if (plen == 7) {
+          uint16_t count   = (uint16_t)payload[1] | ((uint16_t)payload[2] << 7);
+          uint32_t gap     = (uint32_t)payload[3] | ((uint32_t)payload[4] << 7);
+          uint16_t skipLen = (uint16_t)payload[5] | ((uint16_t)payload[6] << 7);
+          loopBegin(count, gap, skipLen);
+        }
+        break;
+      case SCHED_EXT_LOOP_END:          // 0x35
+        loopEnd();
+        break;
     }
   }
 
@@ -1838,8 +1883,8 @@ class Scheduler {
     replay->ps = ParserState();                 // each run resumes at a message boundary
     while (t->pos < t->len) {
       replay->process(t->data[t->pos++]);
-      if (t->time_ms != start) {                // a DELAY_TASK fired
-        if (t->pos >= t->len) t->pos = 0;       // trailing delay -> loop from the start
+      if (t->time_ms != start) {                // a DELAY_TASK fired (or a loop's inter-iteration gap)
+        if (t->pos >= t->len) { t->pos = 0; t->loopDepth = 0; }   // trailing delay -> loop from the start
         running = nullptr;
         return true;
       }
@@ -2479,204 +2524,8 @@ static void sendFrame(const uint8_t *buf, size_t len) {
 
 static bool transportConnected() { return activeTransport != TR_NONE; }
 
+
 /* ==== Arduino entry points ============================================== */
-/* ==== Module subsystem ====================================================
-   Compile-time firmware plugins behind one reserved SysEx (MODULE_DATA 0x0D)
-   and one task ext op (MODULE_OP 0x33) — byte-identical to ESP32FirmataSwift.
-   Modules put results in the scheduler registers, which plugs them into
-   ifTrue/tasks for free. */
-
-static const uint8_t IR_MODULE_ID = 0x01;
-
-struct ModuleEntry { uint8_t id, major, minor; const char *name; };
-static const ModuleEntry moduleTable[] = {
-  { IR_MODULE_ID, 1, 0, "ir" },
-};
-static const uint8_t MODULE_COUNT = sizeof(moduleTable) / sizeof(moduleTable[0]);
-
-static void irHandle(const uint8_t *p, int n);
-static void irTick();
-
-static void moduleDispatch(uint8_t id, const uint8_t *payload, int n) {
-  switch (id) {
-    case IR_MODULE_ID: irHandle(payload, n); break;
-    default: break;
-  }
-}
-
-static void moduleTick() { irTick(); irTxTick(); }
-
-static void handleModuleData(const uint8_t *data, int dlen) {
-  if (dlen < 1) return;
-  if (data[0] == MODULE_QUERY) {
-    int n = 0;
-    frameBuf[n++] = START_SYSEX;
-    frameBuf[n++] = MODULE_DATA;
-    frameBuf[n++] = MODULE_LIST_REPLY;
-    frameBuf[n++] = MODULE_COUNT;
-    for (uint8_t m = 0; m < MODULE_COUNT; m++) {
-      frameBuf[n++] = moduleTable[m].id;
-      frameBuf[n++] = moduleTable[m].major;
-      frameBuf[n++] = moduleTable[m].minor;
-      uint8_t len = (uint8_t)strlen(moduleTable[m].name);
-      frameBuf[n++] = len;
-      for (uint8_t k = 0; k < len; k++) frameBuf[n++] = moduleTable[m].name[k] & 0x7F;
-    }
-    frameBuf[n++] = END_SYSEX;
-    sendFrame(frameBuf, n);
-    return;
-  }
-  moduleDispatch(data[0], data + 1, dlen - 1);
-}
-
-/* ==== IR module (NEC over RMT) ============================================
-   ops: 0x00 <pin> = configure TX (38 kHz carrier); 0x01 <code:5 limbs> = send
-   a 32-bit NEC frame (MSB-first code); 0x02 <pin> <dstReg> = start RX — each
-   decoded frame lands in R[dstReg] and is pushed to the host as event 0x03. */
-
-static int      irTxPin = -1;
-static int      irRxPin = -1;
-static int      irDstReg = 0;
-static rmt_data_t irRxSyms[96];
-static size_t   irRxLen = 0;
-static bool     irRxArmed = false;
-
-// Raw send: p = [0x03, carrierKHz, dur0Lo,dur0Hi, dur1Lo,dur1Hi, ...]. Durations are
-// alternating mark/space (µs, 14-bit LE). Marks HIGH; carrierKHz 0 = no carrier.
-static rmt_data_t irSym[80];       // staged frame(s): frame A, then optional frame B
-static int        irSymA = 0;      // symbols in frame A (B = irSym[irSymA..irSymTotal))
-static int        irSymTotal = 0;
-static int        irTxSendIdx = 0; // send # in a repeat run (even=A, odd=B: RC6 toggle)
-static int        irTxRepeatLeft = 0;
-static uint32_t   irTxGapMs = 0;
-static uint32_t   irTxNextMs = 0;
-
-// Stage 14-bit LE duration pairs from p[start...] into irSym symbols; return the count.
-static int irStageSyms(const uint8_t *p, int n, int start) {
-  int cnt = 0, k = start;
-  while (k + 1 < n && cnt < 80) {
-    uint32_t d0 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2;
-    uint32_t d1 = 1;
-    if (k + 1 < n) { d1 = (uint32_t)(p[k] & 0x7F) | ((uint32_t)(p[k + 1] & 0x7F) << 7); k += 2; }
-    irSym[cnt].level0 = 1; irSym[cnt].duration0 = d0 ? d0 : 1;
-    irSym[cnt].level1 = 0; irSym[cnt].duration1 = d1 ? d1 : 1;
-    cnt++;
-  }
-  return cnt;
-}
-// Send frame A (even idx) or frame B (odd idx, when a distinct B exists — the RC6 toggle
-// variant). NEC/raw have no B → always A.
-static void irSendFrame(int idx) {
-  if (irSymA <= 0) return;
-  bool useB = (irSymTotal > irSymA) && (idx & 1);
-  int off = useB ? irSymA : 0;
-  int cnt = useB ? irSymTotal - irSymA : irSymA;
-  rmtWrite(irTxPin, irSym + off, cnt, 200);
-}
-// op 0x03: single raw send. p = [0x03, carrierKHz, dur pairs...].
-static void irSendRaw(const uint8_t *p, int n) {
-  if (irTxPin < 0 || n < 4) return;
-  uint32_t khz = p[1] & 0x7F;
-  rmtSetCarrier(irTxPin, khz > 0, false, khz * 1000, 0.33f);
-  irTxRepeatLeft = 0;                 // cancel any pending repeat
-  irSymTotal = irStageSyms(p, n, 2);
-  irSymA = irSymTotal;                // one frame, no B
-  irSendFrame(0);
-}
-// op 0x04: repeat/hold. p = [0x04, carrierKHz, repeat, gapLo, gapHi, nA_lo, nA_hi, A durs, B durs].
-// nA = durations in frame A (even); the rest are B (RC6 toggle variant). No B → repeats send A.
-static void irSendRepeat(const uint8_t *p, int n) {
-  if (irTxPin < 0 || n < 8) return;
-  uint32_t khz = p[1] & 0x7F;
-  rmtSetCarrier(irTxPin, khz > 0, false, khz * 1000, 0.33f);
-  int rep = p[2] & 0x7F;
-  irTxGapMs = (uint32_t)(p[3] & 0x7F) | ((uint32_t)(p[4] & 0x7F) << 7);
-  int nA = (int)(p[5] & 0x7F) | ((int)(p[6] & 0x7F) << 7);   // durations in A (even)
-  irSymTotal = irStageSyms(p, n, 7);
-  int aSyms = nA / 2;
-  irSymA = (aSyms > 0 && aSyms < irSymTotal) ? aSyms : irSymTotal;
-  irSendFrame(0);
-  irTxSendIdx = 1;
-  irTxRepeatLeft = rep > 1 ? rep - 1 : 0;
-  irTxNextMs = millis() + irTxGapMs;
-}
-static void irTxTick() {
-  if (irTxRepeatLeft > 0 && irTxPin >= 0 && (int32_t)(millis() - irTxNextMs) >= 0) {
-    irSendFrame(irTxSendIdx);
-    irTxSendIdx++;
-    irTxRepeatLeft--;
-    irTxNextMs = millis() + irTxGapMs;
-  }
-}
-
-static void irHandle(const uint8_t *p, int n) {
-  if (n < 1) return;
-  switch (p[0]) {
-    case 0x00:
-      // Configure the TX pin. The carrier is set per send by the raw op (0x03).
-      if (n >= 2 && rmtInit(p[1] & 0x7F, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 1000000))
-        irTxPin = p[1] & 0x7F;
-      break;
-    case 0x03:
-      irSendRaw(p, n);   // raw mark/space replay (NEC, RC6, any protocol encoded host-side)
-      break;
-    case 0x04:
-      irSendRepeat(p, n);   // repeat/hold — alternates A/B (RC6 toggle), re-sends via irTxTick
-      break;
-    case 0x02:
-      if (n >= 3 && rmtInit(p[1] & 0x7F, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) {
-        irRxPin = p[1] & 0x7F;
-        irDstReg = p[2] & 0x0F;
-        rmtSetRxMaxThreshold(irRxPin, 12000);
-        // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us),
-        // NOT the 1 MHz resolution clock. Larger values make rmt_receive() reject the config
-        // and reception silently never starts. 2 us is safely under the limit.
-        rmtSetRxMinThreshold(irRxPin, 2);
-        irRxLen = sizeof(irRxSyms) / sizeof(irRxSyms[0]);
-        irRxArmed = rmtReadAsync(irRxPin, irRxSyms, &irRxLen);
-      }
-      break;
-    default: break;
-  }
-}
-
-static bool irNear(int32_t v, int32_t target) {
-  return v > target - target / 4 && v < target + target / 4;
-}
-
-static void irTick() {
-  if (irRxPin < 0 || !irRxArmed || !rmtReceiveCompleted(irRxPin)) return;
-  static int32_t d[192];
-  int n = 0;
-  for (size_t i = 0; i < irRxLen && n + 1 < 192; i++) {
-    d[n++] = (int32_t)irRxSyms[i].duration0;
-    d[n++] = (int32_t)irRxSyms[i].duration1;
-  }
-  irRxLen = sizeof(irRxSyms) / sizeof(irRxSyms[0]);
-  irRxArmed = rmtReadAsync(irRxPin, irRxSyms, &irRxLen);
-  if (n < 66) return;
-  int i = 0;
-  while (i + 1 < n && !(irNear(d[i], 9000) && irNear(d[i + 1], 4500))) i++;
-  if (i + 66 > n) return;
-  i += 2;
-  uint32_t code = 0;
-  for (int k = 0; k < 32; k++) {
-    if (!irNear(d[i], 562)) return;
-    if (irNear(d[i + 1], 1687)) code = (code << 1) | 1;
-    else if (irNear(d[i + 1], 562)) code = code << 1;
-    else return;
-    i += 2;
-  }
-  scheduler.regs[irDstReg] = (int32_t)code;
-  uint8_t out[10];
-  int m = 0;
-  out[m++] = START_SYSEX; out[m++] = MODULE_DATA; out[m++] = IR_MODULE_ID; out[m++] = 0x03;
-  uint32_t v = code;
-  for (int k = 0; k < 5; k++) { out[m++] = v & 0x7F; v >>= 7; }
-  out[m++] = END_SYSEX;
-  sendFrame(out, m);
-}
-
 void setup() {
   for (uint8_t i = 0; i < TOTAL_PINS; i++) { servoMinUs[i] = 544; servoMaxUs[i] = 2400; }
   Serial.begin(115200);
