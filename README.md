@@ -93,16 +93,22 @@ a module is one class plus one array entry.
 
 | ID | Module | Purpose |
 |----|--------|---------|
-| `0x01` | `ir` | Infrared NEC/RC6 transmit + NEC receive over RMT |
+| `0x01` | `ir` | Infrared transmit (NEC/RC6/Coolix/raw) + receive (NEC/RC6/Coolix) + raw sniffing over RMT |
+| `0x02` | `sonar` | HC-SR04/US-100 distance → register (one-shot + auto-ping) |
+| `0x03` | `dht` | DHT11/DHT22 → float registers (°C, %RH) + ok flag, 2 s auto-refresh |
+| `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 font — prints text/registers/strings |
 
 The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`)
-with NEC/RC6 encoded host-side (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR));
+with NEC/RC6/Coolix encoded host-side (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR));
 it also carries on-device encoders (`0x05 <protocol> <reg>`) to replay a code held in a
-register. Drive the LED at 5 V, keep the receiver on 3.3 V.
+register. Receive (`0x02 <pin> <reg> [<protocol>]`) decodes NEC, RC6 mode 0, or Coolix from
+one shared raw RMT capture; raw-capture mode (`0x06`) mirrors every burst to the host as
+timings for protocol sniffing. Drive the LED at 5 V, keep the receiver on 3.3 V.
 
 ## Pin map (typical ESP32 dev board)
 
-- Full digital (input/pullup/output/PWM): GPIO 0, 2, 4, 5, 12–19, 21–23, 25–27, 32, 33
+- Full digital (input/pullup/pulldown/output/PWM): GPIO 0, 2, 4, 5, 12–19, 21–23, 25–27, 32, 33
+- Touch T0–T9 (ride analog channels 6–15): GPIO 4, 0, 2, 15, 13, 12, 14, 27, 33, 32 · DAC: GPIO 25, 26
 - Input-only: GPIO 34, 35, 36, 39 · Analog A0–A5 → GPIO 32, 33, 34, 35, 36, 39 · I²C: SDA 21 / SCL 22
 
 ## License

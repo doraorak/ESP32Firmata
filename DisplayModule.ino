@@ -1,0 +1,222 @@
+// Display module (id 0x04): SSD1306 128x64 OLED over I2C — tasks made visible.
+// Mirrors ESP32FirmataSwift's DisplayModuleHandler byte-for-byte.
+
+/* Classic public-domain 5x7 font, ASCII 0x20-0x7F, 5 column bytes per glyph. */
+static const uint8_t DISPLAY_FONT[] = {
+  0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x5F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00, // ' ' ! "
+  0x14,0x7F,0x14,0x7F,0x14, 0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62, // # $ %
+  0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00, 0x00,0x1C,0x22,0x41,0x00, // & ' (
+  0x00,0x41,0x22,0x1C,0x00, 0x08,0x2A,0x1C,0x2A,0x08, 0x08,0x08,0x3E,0x08,0x08, // ) * +
+  0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00, // , - .
+  0x20,0x10,0x08,0x04,0x02, 0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00, // / 0 1
+  0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31, 0x18,0x14,0x12,0x7F,0x10, // 2 3 4
+  0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03, // 5 6 7
+  0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00, // 8 9 :
+  0x00,0x56,0x36,0x00,0x00, 0x00,0x08,0x14,0x22,0x41, 0x14,0x14,0x14,0x14,0x14, // ; < =
+  0x41,0x22,0x14,0x08,0x00, 0x02,0x01,0x51,0x09,0x06, 0x32,0x49,0x79,0x41,0x3E, // > ? @
+  0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22, // A B C
+  0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x01,0x01, // D E F
+  0x3E,0x41,0x41,0x51,0x32, 0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00, // G H I
+  0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41, 0x7F,0x40,0x40,0x40,0x40, // J K L
+  0x7F,0x02,0x04,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E, // M N O
+  0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46, // P Q R
+  0x46,0x49,0x49,0x49,0x31, 0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F, // S T U
+  0x1F,0x20,0x40,0x20,0x1F, 0x7F,0x20,0x18,0x20,0x7F, 0x63,0x14,0x08,0x14,0x63, // V W X
+  0x03,0x04,0x78,0x04,0x03, 0x61,0x51,0x49,0x45,0x43, 0x00,0x00,0x7F,0x41,0x41, // Y Z [
+  0x02,0x04,0x08,0x10,0x20, 0x41,0x41,0x7F,0x00,0x00, 0x04,0x02,0x01,0x02,0x04, // \ ] ^
+  0x40,0x40,0x40,0x40,0x40, 0x00,0x01,0x02,0x04,0x00, 0x20,0x54,0x54,0x54,0x78, // _ ` a
+  0x7F,0x48,0x44,0x44,0x38, 0x38,0x44,0x44,0x44,0x20, 0x38,0x44,0x44,0x48,0x7F, // b c d
+  0x38,0x54,0x54,0x54,0x18, 0x08,0x7E,0x09,0x01,0x02, 0x08,0x14,0x54,0x54,0x3C, // e f g
+  0x7F,0x08,0x04,0x04,0x78, 0x00,0x44,0x7D,0x40,0x00, 0x20,0x40,0x44,0x3D,0x00, // h i j
+  0x00,0x7F,0x10,0x28,0x44, 0x00,0x41,0x7F,0x40,0x00, 0x7C,0x04,0x18,0x04,0x78, // k l m
+  0x7C,0x08,0x04,0x04,0x78, 0x38,0x44,0x44,0x44,0x38, 0x7C,0x14,0x14,0x14,0x08, // n o p
+  0x08,0x14,0x14,0x18,0x7C, 0x7C,0x08,0x04,0x04,0x08, 0x48,0x54,0x54,0x54,0x20, // q r s
+  0x04,0x3F,0x44,0x40,0x20, 0x3C,0x40,0x40,0x20,0x7C, 0x1C,0x20,0x40,0x20,0x1C, // t u v
+  0x3C,0x40,0x30,0x40,0x3C, 0x44,0x28,0x10,0x28,0x44, 0x0C,0x50,0x50,0x50,0x3C, // w x y
+  0x44,0x64,0x54,0x4C,0x44, 0x00,0x08,0x36,0x41,0x00, 0x00,0x00,0x7F,0x00,0x00, // z { |
+  0x00,0x41,0x36,0x08,0x00, 0x08,0x08,0x2A,0x1C,0x08, 0x08,0x1C,0x2A,0x08,0x08, // } ~ ->
+};
+
+/* ==== Display module ======================================================
+   Renders text with a 5x7 font, 8 lines x 21 columns. The op set is aimed at
+   tasks: print a device STRING SLOT or a REGISTER, so an offline task can
+   fetch -> extract -> display. Every print pads with spaces to the end of the
+   line (no ghost characters from longer old text).
+   Ops:
+     0x00 <addr>                        configure (I2C init + clear + on); addr usually 0x3C
+     0x01                               clear the whole display
+     0x02 <line> <col> <len:2> <text>   print literal 7-bit ASCII
+     0x03 <line> <col> <slot>           print snapshot/string slot content (0-11)
+     0x04 <line> <col> <reg>            print R[reg] as decimal
+     0x05 <line> <col> <freg>           print F[freg] with 2 decimals            */
+struct DisplayModuleHandler : ModuleHandler {
+  uint8_t id()    const override { return 0x04; }
+  uint8_t major() const override { return 1; }
+  uint8_t minor() const override { return 0; }
+  const char *name() const override { return "display"; }
+
+  static const int COLS = 21;               // 21 chars x 6 px = 126 of 128 px
+  static const int LINES = 8;
+  int     addr = -1;                        // -1 = unconfigured
+  int     colOffset = 0;                    // SH1106 panels: 132-col RAM, glass at cols 2-129 -> offset 2
+  uint8_t lineBuf[COLS];                    // reused per print; no per-op allocation
+
+  // ---- I2C plumbing (control byte 0x00 = command stream, 0x40 = data stream) ----
+
+  void cmd(uint8_t b) {
+    Wire.beginTransmission((uint8_t)addr);
+    Wire.write((uint8_t)0x00); Wire.write(b);
+    Wire.endTransmission(true);
+  }
+
+  void setCursor(int line, int colPx) {
+    int c = colPx + colOffset;
+    cmd(0xB0 | (line & 0x07));              // page
+    cmd(0x00 | (c & 0x0F));                 // column low nibble
+    cmd(0x10 | ((c >> 4) & 0x0F));          // column high nibble
+  }
+
+  // Stream `count` blank columns (clear covers the full 132-col RAM so SH1106 edge
+  // columns can't keep power-on noise; extra bytes wrap harmlessly on SSD1306).
+  void writeBlank(int count) {
+    int written = 0, chunkLeft = 0;
+    for (int i = 0; i < count; i++) {
+      if (chunkLeft == 0) {
+        if (written > 0) Wire.endTransmission(true);
+        Wire.beginTransmission((uint8_t)addr);
+        Wire.write((uint8_t)0x40);
+        chunkLeft = 24;
+      }
+      Wire.write((uint8_t)0);
+      written++; chunkLeft--;
+    }
+    if (written > 0) Wire.endTransmission(true);
+  }
+
+  // Stream `count` glyph cells (6 px each: 5 font columns + 1 gap) from lineBuf.
+  void writeCells(int count) {
+    int written = 0, chunkLeft = 0;
+    for (int i = 0; i < count; i++) {
+      int c = lineBuf[i];
+      int g = (c >= 0x20 && c <= 0x7F) ? (c - 0x20) * 5 : 0;
+      for (int k = 0; k < 6; k++) {
+        if (chunkLeft == 0) {               // <= 24 data bytes per transmission
+          if (written > 0) Wire.endTransmission(true);
+          Wire.beginTransmission((uint8_t)addr);
+          Wire.write((uint8_t)0x40);
+          chunkLeft = 24;
+        }
+        Wire.write(k < 5 ? DISPLAY_FONT[g + k] : (uint8_t)0);
+        written++; chunkLeft--;
+      }
+    }
+    if (written > 0) Wire.endTransmission(true);
+  }
+
+  // Render lineBuf[0..n) at (line, col), space-padded to the end of the line.
+  void flushLine(int line, int col, int n) {
+    if (addr < 0) return;
+    int c0 = col < 0 ? 0 : (col >= COLS ? COLS - 1 : col);
+    int width = COLS - c0;
+    int count = n > width ? width : n;
+    for (int i = count; i < width; i++) lineBuf[i] = 0x20;   // pad to end of line
+    setCursor(line & 7, c0 * 6);
+    writeCells(width);
+  }
+
+  void clearAll() {
+    if (addr < 0) return;
+    int saved = colOffset;
+    colOffset = 0;                          // clear the whole RAM from absolute column 0
+    for (int line = 0; line < LINES; line++) { setCursor(line, 0); writeBlank(132); }
+    colOffset = saved;
+    setCursor(0, 0);
+  }
+
+  // Write `value` as decimal into lineBuf[at...]; returns the new length.
+  int putInt(int32_t value, int start) {
+    int i = start;
+    if (value < 0 && i < COLS) { lineBuf[i++] = 0x2D; }              // '-'
+    uint32_t mag = value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+    uint8_t digits[11];
+    int n = 0;
+    do { digits[n++] = (uint8_t)(mag % 10) + 0x30; mag /= 10; } while (mag > 0);
+    while (n > 0 && i < COLS) { lineBuf[i++] = digits[--n]; }
+    return i;
+  }
+
+  void handle(const uint8_t *payload, int length) override {
+    if (length < 1) return;
+    switch (payload[0]) {
+      case 0x00:                            // configure: i2c address [+ column offset]
+        if (length >= 2) {
+          addr = payload[1] & 0x7F;
+          colOffset = (length >= 3) ? (payload[2] & 0x7F) : 0;   // 2 = SH1106, 0 = SSD1306
+          Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+          // SSD1306 128x64 init (off -> clocks/geometry -> charge pump -> on).
+          static const uint8_t seq[] = { 0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+                                         0x8D, 0x14, 0x20, 0x02, 0xA1, 0xC8, 0xDA, 0x12,
+                                         0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF };
+          for (uint8_t i = 0; i < sizeof(seq); i++) cmd(seq[i]);
+          clearAll();
+        }
+        break;
+      case 0x01:                            // clear
+        clearAll();
+        break;
+      case 0x02:                            // print literal: line col len:2 text...
+        if (length >= 5) {
+          int line = payload[1] & 0x07, col = payload[2] & 0x7F;
+          int n = (payload[3] & 0x7F) | ((payload[4] & 0x7F) << 7);
+          int count = 0;
+          while (count < n && 5 + count < length && count < COLS) {
+            lineBuf[count] = payload[5 + count] & 0x7F; count++;
+          }
+          flushLine(line, col, count);
+        }
+        break;
+      case 0x03:                            // print string slot: line col slot
+        if (length >= 4) {
+          int line = payload[1] & 0x07, col = payload[2] & 0x7F;
+          int slot = payload[3] & 0x7F;
+          int count = 0;
+          if (slot < NUM_SNAP && scheduler.snapBuf[slot] && scheduler.snapLen[slot] > 0) {
+            const uint8_t *p = scheduler.snapBuf[slot];
+            int len = scheduler.snapLen[slot];
+            while (count < len && count < COLS) { lineBuf[count] = p[count] & 0x7F; count++; }
+          }
+          flushLine(line, col, count);
+        }
+        break;
+      case 0x04:                            // print int register: line col reg
+        if (length >= 4) {
+          int line = payload[1] & 0x07, col = payload[2] & 0x7F;
+          int n = putInt(scheduler.regs[payload[3] & 0x1F], 0);
+          flushLine(line, col, n);
+        }
+        break;
+      case 0x05:                            // print float register (2 decimals): line col freg
+        if (length >= 4) {
+          int line = payload[1] & 0x07, col = payload[2] & 0x7F;
+          float f = scheduler.fregs[payload[3] & (NUM_FLOAT_REGS - 1)];
+          // value x100 rounded, rendered as int.int2; clamped so the conversion can't trap
+          if (f > 2.0e7f) f = 2.0e7f;
+          if (f < -2.0e7f) f = -2.0e7f;
+          int32_t scaled = (int32_t)(f * 100 + (f >= 0 ? 0.5f : -0.5f));
+          int i = putInt(scaled / 100, 0);
+          if (i < COLS) lineBuf[i++] = 0x2E;                         // '.'
+          int32_t frac = scaled % 100; if (frac < 0) frac = -frac;
+          if (i < COLS) lineBuf[i++] = (uint8_t)(frac / 10) + 0x30;
+          if (i < COLS) lineBuf[i++] = (uint8_t)(frac % 10) + 0x30;
+          flushLine(line, col, i);
+        }
+        break;
+      default: break;
+    }
+  }
+
+  void tick() override {}                   // display is command-driven; nothing periodic
+};
+
+/* The module's single instance (registered in ZRegistry.ino). */
+static DisplayModuleHandler displayModule;

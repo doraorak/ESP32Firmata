@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     15
+#define FIRMWARE_MINOR     17
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -157,6 +157,9 @@ static const uint8_t SCHED_EXT_WRITE_PIN       = 0x32;  // write a pin from an o
 static const uint8_t SCHED_EXT_MODULE_OP       = 0x33;  // deliver a payload to a module from a task
 static const uint8_t SCHED_EXT_LOOP            = 0x34;  // begin a counted loop: countLo countHi gapLo gapHi skipLo skipHi
 static const uint8_t SCHED_EXT_LOOP_END        = 0x35;  // end of a counted loop: decrement, jump back + gap, or exit
+static const uint8_t SCHED_EXT_PWM_FREQ        = 0x36;  // set a PWM pin's frequency from an operand (runtime value)
+static const uint8_t SCHED_EXT_DELAY_OP        = 0x37;  // delay milliseconds from an operand (runtime value)
+static const uint8_t SCHED_EXT_ONCE            = 0x38;  // once-per-task-lifetime guard: idx, skip body when already run
 
 // Result-status codes for inspection ops (read with SCHED_EXT_LAST_STATUS).
 static const int32_t ST_OK            = 0;
@@ -173,6 +176,7 @@ static const int32_t ST_ALLOC_FAILED  = 5;
    passive sniffer never sees the password. Provisioned creds persist in NVS and
    override the compile-time WIFI_SSID/WIFI_PASS on the next boot. */
 static const uint8_t MODULE_DATA       = 0x0D;  // module subsystem (user-range SysEx)
+static const uint8_t PWM_CONFIG        = 0x0E;  // per-pin LEDC freq/resolution (user-range SysEx)
 static const uint8_t MODULE_QUERY      = 0x00;
 static const uint8_t MODULE_LIST_REPLY = 0x7F;
 static const uint8_t WIFI_CONFIG = 0x0C;
@@ -192,6 +196,10 @@ static const uint8_t PIN_MODE_PWM    = 0x03;
 static const uint8_t PIN_MODE_SERVO  = 0x04;
 static const uint8_t PIN_MODE_I2C    = 0x06;
 static const uint8_t PIN_MODE_PULLUP = 0x0B;
+// ESP32 extensions (block 0x10+, clear of the standard table)
+static const uint8_t PIN_MODE_PULLDOWN = 0x10;  // internal pull-down (full-digital pins only)
+static const uint8_t PIN_MODE_TOUCH    = 0x11;  // capacitive touch - reads via analog channels 6-15
+static const uint8_t PIN_MODE_DAC      = 0x12;  // true 8-bit analog out (GPIO 25/26)
 
 /* ==== ESP32 pin model =================================================== */
 static const uint8_t TOTAL_PINS = 40;                 // GPIO 0..39
@@ -211,6 +219,20 @@ static const uint8_t I2C_SCL_PIN = 22;
     first function) can see them.
    ==================== */
 static const int SYSEX_MAX = 512;   // fits an HTTP op's URL + body in one SysEx
+
+/* A firmware module: a class deriving from ModuleHandler, one instance per module
+   (each in its own .ino). The base lives here because Arduino concatenates the
+   main sketch first; the registry lives in ZRegistry.ino, which sorts last, so it
+   sees every instance. Mirrors the Swift firmware's ModuleHandler protocol. */
+struct ModuleHandler {
+  virtual uint8_t id()    const = 0;
+  virtual uint8_t major() const = 0;
+  virtual uint8_t minor() const = 0;
+  virtual const char *name() const = 0;
+  virtual void handle(const uint8_t *payload, int length) = 0;
+  virtual void tick() = 0;
+  virtual ~ModuleHandler() {}
+};
 
 /* Firmata input-parser state. Two independent instances exist: one for the live
    host connection and one for replaying scheduler tasks — so a half-received
@@ -243,6 +265,9 @@ struct SchedTask {
   uint16_t loopRemaining[MAX_LOOP_DEPTH] = {0};
   uint32_t loopGap[MAX_LOOP_DEPTH]       = {0};
   uint16_t loopResume[MAX_LOOP_DEPTH]    = {0};
+  // once{} guards taken this task lifetime (bit = ONCE idx). Cleared on (re)schedule
+  // only — NOT on the trailing-delay wraparound.
+  uint32_t onceMask = 0;
 };
 
 // Full digital pins: support INPUT / INPUT_PULLUP / OUTPUT / PWM.
@@ -280,6 +305,19 @@ static int pinOfAnalogChannel(uint8_t ch) {
   return (ch < NUM_ANALOG) ? ANALOG_PINS[ch] : -1;
 }
 
+// Touch sensors T0-T9 ride the analog paths on channels 6-15 (ADC owns 0-5).
+static const int8_t  TOUCH_PINS[] = { 4, 0, 2, 15, 13, 12, 14, 27, 33, 32 };   // T0..T9
+static const uint8_t TOUCH_CHANNEL_BASE = 6;
+static int touchSensorOfPin(uint8_t pin) {
+  for (uint8_t i = 0; i < 10; i++) if (TOUCH_PINS[i] == (int8_t)pin) return i;
+  return -1;
+}
+static int pinOfTouchChannel(uint8_t ch) {
+  int t = (int)ch - TOUCH_CHANNEL_BASE;
+  return (t >= 0 && t < 10) ? TOUCH_PINS[t] : -1;
+}
+static bool isDACPin(uint8_t pin) { return pin == 25 || pin == 26; }
+
 /* ==== Runtime pin / reporting state ===================================== */
 static uint8_t  pinModes[TOTAL_PINS];   // current Firmata mode per pin
 static int      pinValues[TOTAL_PINS];  // last written output / PWM value
@@ -287,6 +325,44 @@ static bool     pinConfigured[TOTAL_PINS]; // host explicitly set a digital mode
 static uint16_t analogReportMask = 0;   // bit c = report analog channel c
 static bool     reportPort[NUM_PORTS];  // digital input reporting per port
 static uint8_t  previousPort[NUM_PORTS];// last reported digital port mask
+static int      pwmMaxDuty[TOTAL_PINS]; // (1 << resBits) - 1; default 8-bit, PWM_CONFIG overrides
+
+/* PWM_CONFIG pins bypass the Arduino core's LEDC layer (its analogWrite-family
+   retune paths proved flaky on rapid frequency changes — melody notes died
+   nondeterministically). Each configured pin gets an IDF-direct LOW-SPEED
+   timer+channel, allocated from the TOP so the core's own bottom-up allocation
+   (servo, plain PWM analogWrite) never collides. Retune = ledc_set_freq only. */
+#include "driver/ledc.h"
+#define FM_LEDC_SLOTS 4
+static int fmLedcPin[FM_LEDC_SLOTS] = { -1, -1, -1, -1 };
+static int fmLedcRes[FM_LEDC_SLOTS] = { 8, 8, 8, 8 };
+static int fmLedcSlotOf(int pin) {
+  for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fmLedcPin[i] == pin) return i;
+  return -1;
+}
+static void fmLedcTimerInit(int slot, uint32_t freq, int res) {
+  ledc_timer_config_t t = {};
+  t.speed_mode      = LEDC_LOW_SPEED_MODE;
+  t.duty_resolution = (ledc_timer_bit_t)res;
+  t.timer_num       = (ledc_timer_t)(3 - slot);
+  t.freq_hz         = freq;
+  t.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&t);
+}
+// Duty write routing: PWM_CONFIG pins -> their IDF channel; others -> analogWrite.
+static void fmPwmWrite(uint8_t pin, int duty) {
+  int slot = fmLedcSlotOf(pin);
+  if (slot >= 0) {
+    // duty == max -> write max+1: LEDC's constant-high point (true 100%, no spike train)
+    uint32_t d = (uint32_t)duty;
+    uint32_t max = (1u << fmLedcRes[slot]) - 1u;
+    if (d >= max) d = max + 1u;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(7 - slot), d);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(7 - slot));
+  } else {
+    analogWrite(pin, duty);
+  }
+}
 
 static uint16_t samplingInterval = 19;  // ms (Firmata default)
 static const uint16_t MIN_SAMPLING = 10;
@@ -385,14 +461,21 @@ static void sendCapabilityResponse() {
     if (isFullDigital(pin)) {
       frameBuf[n++] = PIN_MODE_INPUT;  frameBuf[n++] = 1;
       frameBuf[n++] = PIN_MODE_PULLUP; frameBuf[n++] = 1;
+      frameBuf[n++] = PIN_MODE_PULLDOWN; frameBuf[n++] = 1;
       frameBuf[n++] = PIN_MODE_OUTPUT; frameBuf[n++] = 1;
-      frameBuf[n++] = PIN_MODE_PWM;    frameBuf[n++] = 8;
+      frameBuf[n++] = PIN_MODE_PWM;    frameBuf[n++] = 14;  // up to 14-bit via PWM_CONFIG
       frameBuf[n++] = PIN_MODE_SERVO;  frameBuf[n++] = 14;
       if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) {
         frameBuf[n++] = PIN_MODE_I2C;  frameBuf[n++] = 1;
       }
       if (analogChannelOfPin(pin) >= 0) {
         frameBuf[n++] = PIN_MODE_ANALOG; frameBuf[n++] = 12;
+      }
+      if (touchSensorOfPin(pin) >= 0) {
+        frameBuf[n++] = PIN_MODE_TOUCH; frameBuf[n++] = 14;
+      }
+      if (isDACPin(pin)) {
+        frameBuf[n++] = PIN_MODE_DAC; frameBuf[n++] = 8;
       }
     } else if (isInputOnly(pin)) {
       frameBuf[n++] = PIN_MODE_INPUT; frameBuf[n++] = 1;
@@ -534,6 +617,13 @@ class FirmataProtocol {
     pinValues[pin] = us;
   }
 
+  /* True analog out (8-bit DAC, GPIO 25/26). */
+  void dacOut(uint8_t pin, int value) {
+    int v = value < 0 ? 0 : (value > 255 ? 255 : value);
+    dacWrite(pin, (uint8_t)v);
+    pinValues[pin] = v;
+  }
+
   void handleSetPinMode(uint8_t pin, uint8_t mode) {
     if (pin >= TOTAL_PINS) return;
     if (pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO) ledcDetach(pin);
@@ -562,6 +652,17 @@ class FirmataProtocol {
       case PIN_MODE_I2C:
         pinModes[pin] = mode;
         break;
+      case PIN_MODE_PULLDOWN:
+        // Internal pull-down - full-digital pins only (GPIO 34-39 have no pull resistors).
+        if (isFullDigital(pin)) { pinMode(pin, INPUT_PULLDOWN); pinModes[pin] = mode; pinValues[pin] = 0; pinConfigured[pin] = true; }
+        break;
+      case PIN_MODE_TOUCH:
+        // Capacitive touch - the sensor then reads via its analog channel (6-15), like ANALOG.
+        if (touchSensorOfPin(pin) >= 0) { pinModes[pin] = mode; }
+        break;
+      case PIN_MODE_DAC:
+        if (isDACPin(pin)) { pinModes[pin] = mode; dacOut(pin, 0); }
+        break;
       default:
         break;
     }
@@ -577,6 +678,46 @@ class FirmataProtocol {
     int32_t mx = (int32_t)(data[3] & 0x7F) | ((int32_t)(data[4] & 0x7F) << 7);
     if (mn > 0 && mx > mn) { servoMinUs[pin] = mn; servoMaxUs[pin] = mx; }
     handleSetPinMode(pin, PIN_MODE_SERVO);
+  }
+
+  /* PWM_CONFIG (0x0E): pin, frequency Hz (3 x 7-bit LE, up to ~2 MHz), duty resolution
+     in bits (1-14). Applies the LEDC config and puts the pin in PWM mode (mirrors
+     SERVO_CONFIG's set-the-mode behaviour). On a passive buzzer the frequency IS the tone. */
+  void handlePwmConfig(const uint8_t *data, int len) {
+    if (len < 5) return;
+    uint8_t pin = data[0];
+    if (pin >= TOTAL_PINS || !isFullDigital(pin)) return;
+    int32_t freq = (int32_t)(data[1] & 0x7F) | ((int32_t)(data[2] & 0x7F) << 7) | ((int32_t)(data[3] & 0x7F) << 14);
+    int res = data[4] & 0x7F;
+    if (res < 1) res = 1;
+    if (res > 14) res = 14;
+    if (freq <= 0) return;
+    int slot = fmLedcSlotOf(pin);
+    if (slot < 0) {                                    // first config: claim a slot
+      for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fmLedcPin[i] < 0) { slot = i; break; }
+      if (slot < 0) return;                            // all 4 slots busy
+      fmLedcPin[slot] = pin;
+      fmLedcRes[slot] = res;
+      fmLedcTimerInit(slot, (uint32_t)freq, res);
+      ledc_channel_config_t c = {};
+      c.gpio_num   = pin;
+      c.speed_mode = LEDC_LOW_SPEED_MODE;
+      c.channel    = (ledc_channel_t)(7 - slot);
+      c.intr_type  = LEDC_INTR_DISABLE;
+      c.timer_sel  = (ledc_timer_t)(3 - slot);
+      c.duty       = 0;
+      c.hpoint     = 0;
+      ledc_channel_config(&c);
+    } else if (res != fmLedcRes[slot]) {               // resolution change: re-init timer
+      fmLedcRes[slot] = res;
+      fmLedcTimerInit(slot, (uint32_t)freq, res);
+    } else {                                           // retune only — deterministic
+      ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)(3 - slot), (uint32_t)freq);
+    }
+    pwmMaxDuty[pin] = (1 << res) - 1;
+    pinModes[pin] = PIN_MODE_PWM;
+    pinValues[pin] = 0;
+    pinConfigured[pin] = true;
   }
 
   void handleSetDigitalPinValue(uint8_t pin, uint8_t value) {
@@ -606,10 +747,13 @@ class FirmataProtocol {
     if (pin >= TOTAL_PINS) return;
     int value = (lsb & 0x7F) | ((msb & 0x7F) << 7);
     if (pinModes[pin] == PIN_MODE_PWM) {
-      analogWrite(pin, value > 255 ? 255 : value);
+      int hi = pwmMaxDuty[pin];
+      fmPwmWrite(pin, value > hi ? hi : (value < 0 ? 0 : value));
       pinValues[pin] = value;
     } else if (pinModes[pin] == PIN_MODE_SERVO) {
       servoOut(pin, value);
+    } else if (pinModes[pin] == PIN_MODE_DAC) {
+      dacOut(pin, value);
     }
   }
 
@@ -648,10 +792,13 @@ class FirmataProtocol {
     int value = 0;
     for (int i = 1; i < len; i++) value |= (int)(data[i] & 0x7F) << (7 * (i - 1));
     if (pinModes[pin] == PIN_MODE_PWM) {
-      analogWrite(pin, value > 255 ? 255 : value);
+      int hi = pwmMaxDuty[pin];
+      fmPwmWrite(pin, value > hi ? hi : (value < 0 ? 0 : value));
       pinValues[pin] = value;
     } else if (pinModes[pin] == PIN_MODE_SERVO) {
       servoOut(pin, value);
+    } else if (pinModes[pin] == PIN_MODE_DAC) {
+      dacOut(pin, value);
     }
   }
 
@@ -915,6 +1062,7 @@ class Scheduler {
     if (!t) { sendError(id); return; }
     t->pos = 0;
     t->loopDepth = 0;
+    t->onceMask = 0;
     t->time_ms = millis() + delayMs;
     if (t->time_ms == 0) t->time_ms = 1;        // reserve 0 for "not scheduled"
   }
@@ -1607,10 +1755,13 @@ class Scheduler {
       }
     } else {
       if (pinModes[pin] == PIN_MODE_PWM) {
-        analogWrite(pin, value > 255 ? 255 : (value < 0 ? 0 : value));
+        int hi = pwmMaxDuty[pin];
+        fmPwmWrite(pin, value > hi ? hi : (value < 0 ? 0 : value));
         pinValues[pin] = value;
       } else if (pinModes[pin] == PIN_MODE_SERVO) {
         replay->servoOut(pin, value);
+      } else if (pinModes[pin] == PIN_MODE_DAC) {
+        replay->dacOut(pin, value);
       }
     }
   }
@@ -1716,8 +1867,15 @@ class Scheduler {
         break;
       case SCHED_EXT_READ_ANALOG: {     // 0x12 reg channel
         if (plen == 3) {
-          int pin = pinOfAnalogChannel(payload[2]);
-          regs[payload[1] & 0x1F] = (pin >= 0) ? analogRead(pin) : 0;
+          uint8_t ch = payload[2];
+          if (ch >= TOUCH_CHANNEL_BASE) {
+            int pin = pinOfTouchChannel(ch);
+            regs[payload[1] & 0x1F] =
+              (pin >= 0 && pinModes[pin] == PIN_MODE_TOUCH) ? (int32_t)touchRead((uint8_t)pin) : 0;
+          } else {
+            int pin = pinOfAnalogChannel(ch);
+            regs[payload[1] & 0x1F] = (pin >= 0) ? analogRead(pin) : 0;
+          }
         }
         break;
       }
@@ -1838,6 +1996,65 @@ class Scheduler {
       case SCHED_EXT_LOOP_END:          // 0x35
         loopEnd();
         break;
+      case SCHED_EXT_PWM_FREQ: {        // 0x36 pin <operand> — retune from a runtime value (8-bit duty)
+        if (plen >= 4) {
+          uint8_t pin = payload[1] & 0x7F;
+          if (pin < TOTAL_PINS && isFullDigital(pin)) {
+            int i = 2;
+            Operand v = readOperand(payload, plen, i);
+            int32_t freq = v.isFloat ? f2i(v.f) : v.i;
+            if (freq < 1) freq = 1;
+            if (freq > 0x1FFFFF) freq = 0x1FFFFF;
+            int slot = fmLedcSlotOf(pin);
+            if (slot < 0) {
+              for (int k = 0; k < FM_LEDC_SLOTS; k++) if (fmLedcPin[k] < 0) { slot = k; break; }
+              if (slot >= 0) {
+                fmLedcPin[slot] = pin;
+                fmLedcRes[slot] = 8;
+                fmLedcTimerInit(slot, (uint32_t)freq, 8);
+                ledc_channel_config_t c = {};
+                c.gpio_num   = pin;
+                c.speed_mode = LEDC_LOW_SPEED_MODE;
+                c.channel    = (ledc_channel_t)(7 - slot);
+                c.intr_type  = LEDC_INTR_DISABLE;
+                c.timer_sel  = (ledc_timer_t)(3 - slot);
+                c.duty       = 0;
+                c.hpoint     = 0;
+                ledc_channel_config(&c);
+              }
+            } else {
+              ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)(3 - slot), (uint32_t)freq);
+            }
+            if (slot >= 0) {
+              pwmMaxDuty[pin] = 255;
+              pinModes[pin] = PIN_MODE_PWM;
+              pinConfigured[pin] = true;
+            }
+          }
+        }
+        break;
+      }
+      case SCHED_EXT_DELAY_OP: {        // 0x37 <operand> — delay ms from a runtime value
+        if (plen >= 3) {
+          int i = 1;
+          Operand v = readOperand(payload, plen, i);
+          int32_t msv = v.isFloat ? f2i(v.f) : v.i;
+          if (msv > 0) delayRunning((uint32_t)msv);
+        }
+        break;
+      }
+      case SCHED_EXT_ONCE: {            // 0x38 idx skipLo skipHi — run body on first pass only
+        if (plen == 4 && running != nullptr) {
+          int idx = payload[1] & 0x1F;
+          uint16_t skipLen = (uint16_t)(payload[2] & 0x7F) | ((uint16_t)(payload[3] & 0x7F) << 7);
+          if (running->onceMask & (1UL << idx)) {
+            skip(skipLen);                          // already ran: jump over the body
+          } else {
+            running->onceMask |= (1UL << idx);      // first pass: mark and fall through
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -1933,6 +2150,7 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
       break;
     case STRING_DATA:           handleString(data, dlen);    break;
     case SERVO_CONFIG:          handleServoConfig(data, dlen); break;
+    case PWM_CONFIG:            handlePwmConfig(data, dlen); break;
     case I2C_CONFIG:            handleI2CConfig(data, dlen);  break;
     case I2C_REQUEST:           handleI2CRequest(data, dlen); break;
     case SCHEDULER_DATA:        sched->handleSysex(data, dlen); break;
@@ -1970,10 +2188,16 @@ static void checkDigitalInputs() {
 }
 
 static void sampleAnalogAndI2C() {
-  for (uint8_t ch = 0; ch < NUM_ANALOG; ch++) {
-    if (analogReportMask & (1 << ch)) {
+  // ADC on channels 0-5, touch sensors on 6-15.
+  for (uint8_t ch = 0; ch < 16; ch++) {
+    if (!(analogReportMask & (1 << ch))) continue;
+    if (ch < NUM_ANALOG) {
       int pin = pinOfAnalogChannel(ch);
       if (pin >= 0) sendAnalogReport(ch, analogRead(pin));
+    } else {
+      int pin = pinOfTouchChannel(ch);
+      if (pin >= 0 && pinModes[pin] == PIN_MODE_TOUCH)
+        sendAnalogReport(ch, (int)touchRead((uint8_t)pin));
     }
   }
   for (uint8_t i = 0; i < MAX_CONT_READS; i++) {
@@ -2527,7 +2751,7 @@ static bool transportConnected() { return activeTransport != TR_NONE; }
 
 /* ==== Arduino entry points ============================================== */
 void setup() {
-  for (uint8_t i = 0; i < TOTAL_PINS; i++) { servoMinUs[i] = 544; servoMaxUs[i] = 2400; }
+  for (uint8_t i = 0; i < TOTAL_PINS; i++) { servoMinUs[i] = 544; servoMaxUs[i] = 2400; pwmMaxDuty[i] = 255; }
   Serial.begin(115200);
   delay(200);
   LOGLN();
