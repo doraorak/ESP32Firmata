@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     18
+#define FIRMWARE_MINOR     19
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -252,7 +252,7 @@ struct ParserState {
 
 // Scheduler task storage.
 static const uint8_t  MAX_TASKS      = 8;
-static const uint16_t MAX_TASK_BYTES = 512;
+static const uint16_t MAX_TASK_BYTES = 4096;
 static const uint8_t  MAX_LOOP_DEPTH = 4;   // per-task counted-loop nesting (SCHED_EXT_LOOP)
 
 struct SchedTask {
@@ -389,7 +389,7 @@ static const int     NUM_SNAP       = 12;    // 2 JSON snapshot slots (0–1) + 
 static int32_t servoMinUs[40];
 static int32_t servoMaxUs[40];
 
-static uint8_t   frameBuf[2048];
+static uint8_t   frameBuf[5120];   // holds a full 4096-byte task 8/7-encoded (queryTask reply)
 // Max response bytes retained for JSON/string inspection AND echoed to a host.
 static const int HTTP_PARSE_MAX = 4096;
 
