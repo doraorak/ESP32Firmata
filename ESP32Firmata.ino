@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     19
+#define FIRMWARE_MINOR     20
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 

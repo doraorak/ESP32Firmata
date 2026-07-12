@@ -11,7 +11,7 @@
 struct SonarModuleHandler : ModuleHandler {
   uint8_t id()    const override { return 0x02; }
   uint8_t major() const override { return 1; }
-  uint8_t minor() const override { return 0; }
+  uint8_t minor() const override { return 1; }   // 1.1: op 0x03 one-shot ping -> host reply
   const char *name() const override { return "sonar"; }
 
   int      trigPin = -1;
@@ -51,6 +51,15 @@ struct SonarModuleHandler : ModuleHandler {
           nextPingMs = millis();
         }
         break;
+      case 0x03: {                  // one-shot: ping now, reply cm to the host (no register)
+        uint8_t out[10]; int n = 0;
+        out[n++] = START_SYSEX; out[n++] = MODULE_DATA; out[n++] = id(); out[n++] = 0x03;
+        uint32_t v = (uint32_t)pingCm();          // cm (-1 = no echo) as 5x7-bit limbs
+        for (int k = 0; k < 5; k++) { out[n++] = v & 0x7F; v >>= 7; }
+        out[n++] = END_SYSEX;
+        sendFrame(out, n);
+        break;
+      }
       default: break;
     }
   }

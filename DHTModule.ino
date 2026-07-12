@@ -71,7 +71,7 @@ static int dhtRead(uint8_t pinIn, int type, float *temp_c, float *hum_pct) {
 struct DHTModuleHandler : ModuleHandler {
   uint8_t id()    const override { return 0x03; }
   uint8_t major() const override { return 1; }
-  uint8_t minor() const override { return 0; }
+  uint8_t minor() const override { return 1; }   // 1.1: op 0x02 one-shot read -> host reply
   const char *name() const override { return "dht"; }
 
   int      pin = -1;
@@ -95,9 +95,22 @@ struct DHTModuleHandler : ModuleHandler {
           nextReadMs = millis();    // first read on the next tick
         }
         break;
-      case 0x01:                    // read now
+      case 0x01:                    // read now (auto-read path; updates registers next tick)
         nextReadMs = millis();
         break;
+      case 0x02: {                  // one-shot: read now, reply temp+humidity+status to host
+        float t = 0, h = 0;
+        uint8_t ok = (pin >= 0 && dhtRead((uint8_t)pin, sensorType, &t, &h) == 0) ? 1 : 0;
+        uint8_t out[16]; int n = 0;
+        out[n++] = START_SYSEX; out[n++] = MODULE_DATA; out[n++] = id(); out[n++] = 0x02; out[n++] = ok;
+        uint32_t tb; memcpy(&tb, &t, 4);            // deg C  as 5x7-bit limbs of the IEEE-754 bits
+        for (int k = 0; k < 5; k++) { out[n++] = tb & 0x7F; tb >>= 7; }
+        uint32_t hb; memcpy(&hb, &h, 4);            // %RH as 5x7-bit limbs
+        for (int k = 0; k < 5; k++) { out[n++] = hb & 0x7F; hb >>= 7; }
+        out[n++] = END_SYSEX;
+        sendFrame(out, n);
+        break;
+      }
       default: break;
     }
   }
