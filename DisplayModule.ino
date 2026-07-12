@@ -37,6 +37,23 @@ static const uint8_t DISPLAY_FONT[] = {
   0x00,0x41,0x36,0x08,0x00, 0x08,0x08,0x2A,0x1C,0x08, 0x08,0x1C,0x2A,0x08,0x08, // } ~ ->
 };
 
+/* Hand-designed 4x6 tiny font, ASCII 0x20-0x7E, 4 column bytes per glyph (low 6 bits = rows,
+   top->bottom). Drawn (not downscaled) so brackets/verticals stay crisp. */
+static const uint8_t DISPLAY_TINY[] = {
+    0x00,0x00,0x00,0x00, 0x00,0x2F,0x00,0x00, 0x03,0x00,0x03,0x00, 0x0A,0x1F,0x0A,0x1F, 0x12,0x35,0x1F,0x01, 0x09,0x04,0x02,0x09, 0x0A,0x15,0x1A,0x00, 0x00,0x03,0x00,0x00,
+    0x00,0x0E,0x11,0x00, 0x00,0x11,0x0E,0x00, 0x0A,0x04,0x0A,0x00, 0x04,0x0E,0x04,0x00, 0x20,0x10,0x00,0x00, 0x04,0x04,0x04,0x00, 0x00,0x10,0x00,0x00, 0x08,0x04,0x02,0x01,
+    0x0E,0x11,0x11,0x0E, 0x12,0x1F,0x10,0x00, 0x12,0x19,0x15,0x12, 0x11,0x15,0x1F,0x00, 0x07,0x04,0x1F,0x04, 0x17,0x15,0x1D,0x01, 0x0E,0x15,0x15,0x08, 0x01,0x1D,0x03,0x01,
+    0x0A,0x15,0x15,0x0A, 0x02,0x15,0x1D,0x06, 0x00,0x0A,0x00,0x00, 0x10,0x0A,0x00,0x00, 0x04,0x0A,0x11,0x00, 0x0A,0x0A,0x0A,0x00, 0x11,0x0A,0x04,0x00, 0x02,0x11,0x05,0x02,
+    0x0E,0x11,0x15,0x06, 0x1E,0x05,0x05,0x1E, 0x1F,0x15,0x15,0x0A, 0x0E,0x11,0x11,0x0A, 0x1F,0x11,0x0A,0x04, 0x1F,0x15,0x15,0x11, 0x1F,0x05,0x05,0x01, 0x0E,0x11,0x15,0x1C,
+    0x1F,0x04,0x04,0x1F, 0x11,0x1F,0x11,0x00, 0x08,0x10,0x11,0x0F, 0x1F,0x04,0x0A,0x11, 0x1F,0x10,0x10,0x10, 0x1F,0x02,0x02,0x1F, 0x1F,0x02,0x04,0x1F, 0x0E,0x11,0x11,0x0E,
+    0x1F,0x05,0x05,0x02, 0x0E,0x11,0x09,0x16, 0x1F,0x05,0x0D,0x12, 0x12,0x15,0x15,0x09, 0x01,0x1F,0x01,0x00, 0x0F,0x10,0x10,0x0F, 0x07,0x18,0x18,0x07, 0x1F,0x08,0x08,0x1F,
+    0x11,0x0E,0x0E,0x11, 0x03,0x1C,0x04,0x03, 0x19,0x15,0x13,0x11, 0x1F,0x11,0x11,0x00, 0x01,0x00,0x06,0x08, 0x11,0x11,0x1F,0x00, 0x02,0x01,0x02,0x00, 0x10,0x10,0x10,0x10,
+    0x01,0x02,0x00,0x00, 0x10,0x1A,0x1E,0x18, 0x1F,0x14,0x14,0x08, 0x0C,0x12,0x12,0x00, 0x08,0x14,0x14,0x1F, 0x0C,0x16,0x16,0x04, 0x04,0x1E,0x05,0x00, 0x04,0x2A,0x2A,0x1E,
+    0x1F,0x04,0x04,0x18, 0x00,0x1D,0x00,0x00, 0x10,0x20,0x1D,0x00, 0x1F,0x04,0x0A,0x10, 0x11,0x1F,0x10,0x00, 0x1E,0x06,0x0C,0x1E, 0x1E,0x02,0x02,0x1C, 0x0C,0x12,0x12,0x0C,
+    0x3E,0x0A,0x0A,0x04, 0x04,0x0A,0x0A,0x3E, 0x1E,0x04,0x02,0x02, 0x14,0x16,0x1A,0x0A, 0x02,0x0F,0x12,0x00, 0x0E,0x10,0x10,0x1E, 0x06,0x18,0x18,0x06, 0x1E,0x08,0x0C,0x1E,
+    0x12,0x0C,0x0C,0x12, 0x06,0x28,0x28,0x1E, 0x12,0x1A,0x16,0x12, 0x04,0x0E,0x11,0x00, 0x00,0x1F,0x00,0x00, 0x11,0x0E,0x04,0x00, 0x04,0x02,0x04,0x02,
+};
+
 /* ==== Display module ======================================================
    Renders text with a 5x7 font, 8 lines x 21 columns. The op set is aimed at
    tasks: print a device STRING SLOT or a REGISTER, so an offline task can
@@ -55,11 +72,15 @@ struct DisplayModuleHandler : ModuleHandler {
   uint8_t minor() const override { return 0; }
   const char *name() const override { return "display"; }
 
-  static const int COLS = 21;               // 21 chars x 6 px = 126 of 128 px
   static const int LINES = 8;
   int     addr = -1;                        // -1 = unconfigured
   int     colOffset = 0;                    // SH1106 panels: 132-col RAM, glass at cols 2-129 -> offset 2
-  uint8_t lineBuf[COLS];                    // reused per print; no per-op allocation
+  bool    smallFont = false;                // configure flag: 4x6 tiny font (25 cols) vs 5x7 (21 cols)
+  uint8_t lineBuf[25];                      // reused per print; sized for the tiny font
+  // Glyph metrics switch with the font (normal 5x7 in a 6-px cell / tiny 4x6 in a 5-px cell).
+  int cellPx()    const { return smallFont ? 5 : 6; }
+  int glyphCols() const { return smallFont ? 4 : 5; }
+  int cols()      const { return smallFont ? 25 : 21; }
 
   // ---- I2C plumbing (control byte 0x00 = command stream, 0x40 = data stream) ----
 
@@ -95,18 +116,22 @@ struct DisplayModuleHandler : ModuleHandler {
 
   // Stream `count` glyph cells (6 px each: 5 font columns + 1 gap) from lineBuf.
   void writeCells(int count) {
+    const int cell = cellPx(), glyphW = glyphCols();
     int written = 0, chunkLeft = 0;
     for (int i = 0; i < count; i++) {
       int c = lineBuf[i];
-      int g = (c >= 0x20 && c <= 0x7F) ? (c - 0x20) * 5 : 0;
-      for (int k = 0; k < 6; k++) {
+      bool inRange = c >= 0x20 && c <= 0x7E;
+      for (int k = 0; k < cell; k++) {
         if (chunkLeft == 0) {               // <= 24 data bytes per transmission
           if (written > 0) Wire.endTransmission(true);
           Wire.beginTransmission((uint8_t)addr);
           Wire.write((uint8_t)0x40);
           chunkLeft = 24;
         }
-        Wire.write(k < 5 ? DISPLAY_FONT[g + k] : (uint8_t)0);
+        uint8_t byte = 0;
+        if (k < glyphW && inRange)
+          byte = smallFont ? DISPLAY_TINY[(c - 0x20) * 4 + k] : DISPLAY_FONT[(c - 0x20) * 5 + k];
+        Wire.write(byte);
         written++; chunkLeft--;
       }
     }
@@ -116,12 +141,32 @@ struct DisplayModuleHandler : ModuleHandler {
   // Render lineBuf[0..n) at (line, col), space-padded to the end of the line.
   void flushLine(int line, int col, int n) {
     if (addr < 0) return;
-    int c0 = col < 0 ? 0 : (col >= COLS ? COLS - 1 : col);
-    int width = COLS - c0;
+    int c0 = col < 0 ? 0 : (col >= cols() ? cols() - 1 : col);
+    int width = cols() - c0;
     int count = n > width ? width : n;
     for (int i = count; i < width; i++) lineBuf[i] = 0x20;   // pad to end of line
-    setCursor(line & 7, c0 * 6);
+    setCursor(line & 7, c0 * cellPx());
     writeCells(width);
+  }
+
+  // Render `len` bytes from `src` starting at (startLine, col), WRAPPING onto the lines below
+  // when the text is longer than the line — a long string continues downward instead of being
+  // truncated. Stops at the bottom of the panel; each written line is space-padded to its end.
+  void flushWrapped(int startLine, int col, const uint8_t *src, int len) {
+    if (addr < 0) return;
+    int idx = 0;
+    int line = startLine < 0 ? 0 : startLine;
+    int c0 = col < 0 ? 0 : (col >= cols() ? cols() - 1 : col);
+    while (line < LINES) {
+      int width = cols() - c0;
+      int count = 0;
+      while (count < width && idx < len) { lineBuf[count] = src[idx] & 0x7F; count++; idx++; }
+      for (int i = count; i < width; i++) lineBuf[i] = 0x20;   // pad this line to its end
+      setCursor(line & 7, c0 * cellPx());
+      writeCells(width);
+      if (idx >= len) break;
+      line++; c0 = 0;
+    }
   }
 
   void clearAll() {
@@ -136,12 +181,12 @@ struct DisplayModuleHandler : ModuleHandler {
   // Write `value` as decimal into lineBuf[at...]; returns the new length.
   int putInt(int32_t value, int start) {
     int i = start;
-    if (value < 0 && i < COLS) { lineBuf[i++] = 0x2D; }              // '-'
+    if (value < 0 && i < cols()) { lineBuf[i++] = 0x2D; }              // '-'
     uint32_t mag = value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
     uint8_t digits[11];
     int n = 0;
     do { digits[n++] = (uint8_t)(mag % 10) + 0x30; mag /= 10; } while (mag > 0);
-    while (n > 0 && i < COLS) { lineBuf[i++] = digits[--n]; }
+    while (n > 0 && i < cols()) { lineBuf[i++] = digits[--n]; }
     return i;
   }
 
@@ -152,6 +197,7 @@ struct DisplayModuleHandler : ModuleHandler {
         if (length >= 2) {
           addr = payload[1] & 0x7F;
           colOffset = (length >= 3) ? (payload[2] & 0x7F) : 0;   // 2 = SH1106, 0 = SSD1306
+          smallFont = (length >= 4) && ((payload[3] & 0x7F) != 0);   // 1 = tiny 4x6 font
           Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
           // SSD1306 128x64 init (off -> clocks/geometry -> charge pump -> on).
           static const uint8_t seq[] = { 0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
@@ -168,24 +214,20 @@ struct DisplayModuleHandler : ModuleHandler {
         if (length >= 5) {
           int line = payload[1] & 0x07, col = payload[2] & 0x7F;
           int n = (payload[3] & 0x7F) | ((payload[4] & 0x7F) << 7);
-          int count = 0;
-          while (count < n && 5 + count < length && count < COLS) {
-            lineBuf[count] = payload[5 + count] & 0x7F; count++;
-          }
-          flushLine(line, col, count);
+          int avail = length - 5; if (avail < 0) avail = 0;
+          int count = n < avail ? n : avail;
+          flushWrapped(line, col, payload + 5, count);
         }
         break;
       case 0x03:                            // print string slot: line col slot
         if (length >= 4) {
           int line = payload[1] & 0x07, col = payload[2] & 0x7F;
           int slot = payload[3] & 0x7F;
-          int count = 0;
           if (slot < NUM_SNAP && scheduler.snapBuf[slot] && scheduler.snapLen[slot] > 0) {
-            const uint8_t *p = scheduler.snapBuf[slot];
-            int len = scheduler.snapLen[slot];
-            while (count < len && count < COLS) { lineBuf[count] = p[count] & 0x7F; count++; }
+            flushWrapped(line, col, scheduler.snapBuf[slot], scheduler.snapLen[slot]);
+          } else {
+            flushLine(line, col, 0);          // empty slot: clear the line
           }
-          flushLine(line, col, count);
         }
         break;
       case 0x04:                            // print int register: line col reg
@@ -204,10 +246,10 @@ struct DisplayModuleHandler : ModuleHandler {
           if (f < -2.0e7f) f = -2.0e7f;
           int32_t scaled = (int32_t)(f * 100 + (f >= 0 ? 0.5f : -0.5f));
           int i = putInt(scaled / 100, 0);
-          if (i < COLS) lineBuf[i++] = 0x2E;                         // '.'
+          if (i < cols()) lineBuf[i++] = 0x2E;                         // '.'
           int32_t frac = scaled % 100; if (frac < 0) frac = -frac;
-          if (i < COLS) lineBuf[i++] = (uint8_t)(frac / 10) + 0x30;
-          if (i < COLS) lineBuf[i++] = (uint8_t)(frac % 10) + 0x30;
+          if (i < cols()) lineBuf[i++] = (uint8_t)(frac / 10) + 0x30;
+          if (i < cols()) lineBuf[i++] = (uint8_t)(frac % 10) + 0x30;
           flushLine(line, col, i);
         }
         break;

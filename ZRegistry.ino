@@ -16,6 +16,10 @@ static void moduleTick() {
   for (uint8_t i = 0; i < MODULE_COUNT; i++) modules[i]->tick();
 }
 
+static void moduleReset() {
+  for (uint8_t i = 0; i < MODULE_COUNT; i++) modules[i]->reset();
+}
+
 static void handleModuleData(const uint8_t *data, int length) {
   if (length < 1) return;
   if (data[0] == MODULE_QUERY) {

@@ -12,17 +12,20 @@
    txTick); 0x05 <protocol> <srcReg> = encode+send a numeric code from a register;
    0x06 <pin> <enable> = raw capture — every received burst (any protocol) is pushed
    as event 0x07 <totalLo> <totalHi> <durations as 14-bit LE pairs> for protocol
-   sniffing (AC remotes etc.); NEC decode keeps running alongside. */
+   sniffing (AC remotes etc.); NEC decode keeps running alongside;
+   0x08 <pin> <slot> = receive raw timings as the text "[d0,d1,...]" into device string
+   <slot> — printable on the OLED / inspectable to learn a protocol. */
 struct IRModuleHandler : ModuleHandler {
   uint8_t id()    const override { return 0x01; }
   uint8_t major() const override { return 1; }
-  uint8_t minor() const override { return 2; }
+  uint8_t minor() const override { return 3; }
   const char *name() const override { return "ir"; }
 
   int      txPin = -1;
   int      rxPin = -1;
   int      dstReg = 0;
   uint8_t  rxProtocol = 0;                    // 0 NEC, 1 RC6, 2 Coolix
+  int      rawTextSlot = -1;                  // op 0x08: format each burst as text into this slot
   bool     rawReport = false;                 // op 0x06: mirror captures to the host
   rmt_data_t rxSyms[128];                     // full 2-block capacity: 256 durations
   size_t   rxLen = 0;
@@ -168,6 +171,40 @@ struct IRModuleHandler : ModuleHandler {
     return packSyms(d, n);
   }
 
+  // Arm the RMT receiver on `pin` only when the pin changes, so re-running a receive op
+  // (e.g. every pass of a repeating task) never resets a capture in progress. Returns true
+  // when the receiver is armed on `pin`.
+  // (Re)configure the RX peripheral on `pin` and start an async read. Used for the first
+  // arm AND to re-arm after each captured frame — a bare rmtReadAsync re-arm did NOT reliably
+  // re-trigger rmtReceiveCompleted (only the first frame per arming was seen), so re-running
+  // the full init gives a clean state for every subsequent frame.
+  bool startRx(int pin) {
+    rmtDeinit(pin);   // free any RMT channel already on this pin — re-init after every frame
+                      // would otherwise leak channels and reception dies after a few presses
+    if (!rmtInit(pin, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) return false;
+    rxPin = pin;
+    rmtSetRxMaxThreshold(rxPin, 12000);
+    // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us), NOT
+    // the 1 MHz resolution clock. Larger values make rmt_receive() reject the config and
+    // reception silently never starts. 2 us is safely under the limit.
+    rmtSetRxMinThreshold(rxPin, 2);
+    rxLen = sizeof(rxSyms) / sizeof(rxSyms[0]);
+    rxArmed = rmtReadAsync(rxPin, rxSyms, &rxLen);
+    return rxArmed;
+  }
+  bool armRx(int pin) {
+    if (rxPin == pin && rxArmed) return true;
+    return startRx(pin);
+  }
+
+  // SYSTEM_RESET forgets the receiver (systemResetState reset every pin to input, detaching
+  // the RMT receiver) so the pin-change-gated arm re-inits on the next op instead of skipping.
+  void reset() override {
+    rxPin = -1;
+    rawTextSlot = -1;
+    rawReport = false;
+  }
+
   void handle(const uint8_t *payload, int length) override {
     if (length < 1) return;
     switch (payload[0]) {
@@ -199,17 +236,17 @@ struct IRModuleHandler : ModuleHandler {
         }
         break;
       case 0x02:
-        if (length >= 3 && rmtInit(payload[1] & 0x7F, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) {
-          rxPin = payload[1] & 0x7F;
+        if (length >= 3 && armRx(payload[1] & 0x7F)) {
           dstReg = payload[2] & 0x1F;
           rxProtocol = length >= 4 ? (payload[3] & 0x7F) : 0;
-          rmtSetRxMaxThreshold(rxPin, 12000);
-          // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us),
-          // NOT the 1 MHz resolution clock. Larger values make rmt_receive() reject the config
-          // and reception silently never starts. 2 us is safely under the limit.
-          rmtSetRxMinThreshold(rxPin, 2);
-          rxLen = sizeof(rxSyms) / sizeof(rxSyms[0]);
-          rxArmed = rmtReadAsync(rxPin, rxSyms, &rxLen);
+        }
+        break;
+      case 0x08:
+        // Receive raw timings as TEXT into a device string slot: <pin> <slot>. Each burst is
+        // formatted "[d0,d1,d2,...]" into the slot — printable on the OLED (displayPrint string)
+        // or inspectable, so an unknown remote's protocol can be read off directly.
+        if (length >= 3 && armRx(payload[1] & 0x7F)) {
+          rawTextSlot = payload[2] & 0x7F;
         }
         break;
       case 0x06:
@@ -247,8 +284,7 @@ struct IRModuleHandler : ModuleHandler {
       durations[count++] = (int32_t)rxSyms[i].duration0;
       durations[count++] = (int32_t)rxSyms[i].duration1;
     }
-    rxLen = sizeof(rxSyms) / sizeof(rxSyms[0]);
-    rxArmed = rmtReadAsync(rxPin, rxSyms, &rxLen);
+    startRx(rxPin);   // full re-init: reliably re-arms for the NEXT frame (repeated presses)
     if (rawReport && count >= 6) {              // skip sub-3-symbol noise blips
       static uint8_t rawOut[6 + 256 * 2 + 1];
       int outIndex = 0;
@@ -270,6 +306,9 @@ struct IRModuleHandler : ModuleHandler {
     }
     // All protocols decode the same raw capture the sniffer sees (op 0x02's protocol
     // byte picks the decoder; a burst that doesn't parse is simply ignored).
+    // Only format a REAL burst (poll returns 0 between frames — formatting those would
+    // overwrite the capture with "[]" microseconds later).
+    if (rawTextSlot >= 0 && count >= 6) formatRawText(durations, count);
     if (rxProtocol == 1)      decodeRC6Capture(durations, count);
     else if (rxProtocol == 2) decodeCoolixCapture(durations, count);
     else                      decodeNECCapture(durations, count);
@@ -374,8 +413,36 @@ struct IRModuleHandler : ModuleHandler {
       p += 2 * width;
       bitsRead++;
     }
+    // A frame whose LAST bit is a 1 ends mark-then-space — that final space merges into
+    // the idle gap and is never captured, leaving a lone trailing mark half-unit. Infer
+    // the bit (vol-down 0x11 decoded as 0x8 without this; ...0 frames end on a captured mark).
+    if (bitsRead < 32 && p < unitCount && unitLevel[p]) {
+      code = (code << 1) | 1;
+      bitsRead++;
+    }
     if (bitsRead < 16) return;
     emitReceived(code);
+  }
+
+  // Format a raw capture as the ASCII string "[d0,d1,d2,...]" into device string rawTextSlot.
+  // Capped at ~500 bytes (~90 durations) — enough for a full NEC frame and the header + lead
+  // bits of longer AC frames, which is what fingerprints a protocol.
+  void formatRawText(const int32_t *durations, int count) {
+    if (rawTextSlot < 0 || rawTextSlot >= NUM_SNAP) return;
+    static char buf[512];
+    int out = 0;
+    buf[out++] = '[';
+    for (int i = 0; i < count && out < 495; i++) {
+      if (i > 0) buf[out++] = ',';
+      int32_t d = durations[i]; if (d < 0) d = 0;
+      out += snprintf(buf + out, sizeof(buf) - out, "%ld", (long)d);
+    }
+    if (out < 511) buf[out++] = ']';
+    uint8_t *nb = (uint8_t *)realloc(scheduler.snapBuf[rawTextSlot], out > 0 ? out : 1);
+    if (!nb) return;
+    memcpy(nb, buf, out);
+    scheduler.snapBuf[rawTextSlot] = nb;
+    scheduler.snapLen[rawTextSlot] = out;
   }
 };
 

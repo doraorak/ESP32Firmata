@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     17
+#define FIRMWARE_MINOR     18
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -231,6 +231,9 @@ struct ModuleHandler {
   virtual const char *name() const = 0;
   virtual void handle(const uint8_t *payload, int length) = 0;
   virtual void tick() = 0;
+  // Drop peripheral state on SYSTEM_RESET (which resets every pin to input, detaching an
+  // RMT receiver from its pin) so the module re-arms on its next op. Default: nothing.
+  virtual void reset() {}
   virtual ~ModuleHandler() {}
 };
 
@@ -2230,6 +2233,7 @@ static void systemResetState() {
     pinValues[pin]     = 0;
     pinConfigured[pin] = false;
   }
+  moduleReset();       // the pin-mode reset above detaches RMT receivers — let modules re-arm
   samplingInterval = 19;
 }
 

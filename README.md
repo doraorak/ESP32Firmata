@@ -93,17 +93,18 @@ a module is one class plus one array entry.
 
 | ID | Module | Purpose |
 |----|--------|---------|
-| `0x01` | `ir` | Infrared transmit (NEC/RC6/Coolix/raw) + receive (NEC/RC6/Coolix) + raw sniffing over RMT |
+| `0x01` | `ir` | Infrared transmit (NEC/RC6/Coolix/raw) + receive (NEC/RC6/Coolix, or raw timings as text) + sniffing over RMT |
 | `0x02` | `sonar` | HC-SR04/US-100 distance → register (one-shot + auto-ping) |
 | `0x03` | `dht` | DHT11/DHT22 → float registers (°C, %RH) + ok flag, 2 s auto-refresh |
-| `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 font — prints text/registers/strings |
+| `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 or compact 4×6 font — prints text/registers/strings, wraps long lines |
 
 The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`)
 with NEC/RC6/Coolix encoded host-side (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR));
 it also carries on-device encoders (`0x05 <protocol> <reg>`) to replay a code held in a
 register. Receive (`0x02 <pin> <reg> [<protocol>]`) decodes NEC, RC6 mode 0, or Coolix from
 one shared raw RMT capture; raw-capture mode (`0x06`) mirrors every burst to the host as
-timings for protocol sniffing. Drive the LED at 5 V, keep the receiver on 3.3 V.
+timings for protocol sniffing, and `0x08` writes a burst's timings as text into a device
+string slot. Drive the LED at 5 V, keep the receiver on 3.3 V.
 
 ## Pin map (typical ESP32 dev board)
 
