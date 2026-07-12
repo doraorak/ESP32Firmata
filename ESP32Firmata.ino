@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     20
+#define FIRMWARE_MINOR     21
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -177,6 +177,7 @@ static const int32_t ST_ALLOC_FAILED  = 5;
    override the compile-time WIFI_SSID/WIFI_PASS on the next boot. */
 static const uint8_t MODULE_DATA       = 0x0D;  // module subsystem (user-range SysEx)
 static const uint8_t PWM_CONFIG        = 0x0E;  // per-pin LEDC freq/resolution (user-range SysEx)
+static const uint8_t TONE_CONFIG       = 0x0B;  // <pin> <freq:14b> <dur:14b>: tone on a .tone pin
 static const uint8_t MODULE_QUERY      = 0x00;
 static const uint8_t MODULE_LIST_REPLY = 0x7F;
 static const uint8_t WIFI_CONFIG = 0x0C;
@@ -196,6 +197,7 @@ static const uint8_t PIN_MODE_PWM    = 0x03;
 static const uint8_t PIN_MODE_SERVO  = 0x04;
 static const uint8_t PIN_MODE_I2C    = 0x06;
 static const uint8_t PIN_MODE_PULLUP = 0x0B;
+static const uint8_t PIN_MODE_TONE   = 0x0E;  // square-wave tone out (LEDC); write via TONE_CONFIG
 // ESP32 extensions (block 0x10+, clear of the standard table)
 static const uint8_t PIN_MODE_PULLDOWN = 0x10;  // internal pull-down (full-digital pins only)
 static const uint8_t PIN_MODE_TOUCH    = 0x11;  // capacitive touch - reads via analog channels 6-15
@@ -367,6 +369,29 @@ static void fmPwmWrite(uint8_t pin, int duty) {
   }
 }
 
+/* ==== Tone (.tone pin): auto-stop timers for TONE_CONFIG durations (0 = no timer).
+   toneTimersActive lets the tick skip the scan when none are pending. ==== */
+static uint32_t toneOffMs[TOTAL_PINS] = {0};
+static int toneTimersActive = 0;
+static void fmSetToneTimer(uint8_t pin, uint32_t durMs) {
+  if (toneOffMs[pin] == 0) toneTimersActive++;
+  uint32_t off = millis() + durMs;
+  if (off == 0) off = 1;                 // 0 is the "no timer" sentinel
+  toneOffMs[pin] = off;
+}
+static void fmClearToneTimer(uint8_t pin) {
+  if (toneOffMs[pin] != 0) { toneTimersActive--; toneOffMs[pin] = 0; }
+}
+static void toneTick() {
+  if (toneTimersActive == 0) return;
+  uint32_t now = millis();
+  for (uint8_t pin = 0; pin < TOTAL_PINS; pin++) {
+    if (toneOffMs[pin] != 0 && (int32_t)(now - toneOffMs[pin]) >= 0) {
+      fmPwmWrite(pin, 0); pinValues[pin] = 0; fmClearToneTimer(pin);
+    }
+  }
+}
+
 static uint16_t samplingInterval = 19;  // ms (Firmata default)
 static const uint16_t MIN_SAMPLING = 10;
 static unsigned long  lastSampleMs = 0;
@@ -498,6 +523,9 @@ static void sendAnalogMappingResponse() {
   frameBuf[n++] = ANALOG_MAPPING_RESPONSE;
   for (uint8_t pin = 0; pin < TOTAL_PINS; pin++) {
     int ch = analogChannelOfPin(pin);
+    // Touch pins with no ADC channel report their touch channel (6-15) so the host
+    // can read them via analogRead(channel:) / touchRead(pin:).
+    if (ch < 0 && touchSensorOfPin(pin) >= 0) ch = TOUCH_CHANNEL_BASE + touchSensorOfPin(pin);
     frameBuf[n++] = (ch >= 0) ? (uint8_t)ch : 0x7F;
   }
   frameBuf[n++] = END_SYSEX;
@@ -630,6 +658,7 @@ class FirmataProtocol {
   void handleSetPinMode(uint8_t pin, uint8_t mode) {
     if (pin >= TOTAL_PINS) return;
     if (pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO) ledcDetach(pin);
+    if (pinModes[pin] == PIN_MODE_TONE  && mode != PIN_MODE_TONE)  { fmPwmWrite(pin, 0); fmClearToneTimer(pin); }
     switch (mode) {
       case PIN_MODE_INPUT:
         if (isUsable(pin)) { pinMode(pin, INPUT); pinModes[pin] = mode; pinConfigured[pin] = true; }
@@ -666,6 +695,9 @@ class FirmataProtocol {
       case PIN_MODE_DAC:
         if (isDACPin(pin)) { pinModes[pin] = mode; dacOut(pin, 0); }
         break;
+      case PIN_MODE_TONE:
+        if (isFullDigital(pin)) { pinModes[pin] = mode; pwmMaxDuty[pin] = 255; pinValues[pin] = 0; pinConfigured[pin] = true; }
+        break;
       default:
         break;
     }
@@ -683,6 +715,41 @@ class FirmataProtocol {
     handleSetPinMode(pin, PIN_MODE_SERVO);
   }
 
+  /* Configure a pin's LEDC timer+channel at `freq`/`res` bits (shared by PWM_CONFIG and
+     tone). Claims one of the 4 IDF low-speed slots; retunes in place on later calls. */
+  void ledcConfigure(uint8_t pin, uint32_t freq, int res) {
+    int slot = fmLedcSlotOf(pin);
+    if (slot < 0) {                                    // first config: claim a slot
+      for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fmLedcPin[i] < 0) { slot = i; break; }
+      if (slot < 0) return;                            // all 4 slots busy
+      fmLedcPin[slot] = pin;
+      fmLedcRes[slot] = res;
+      fmLedcTimerInit(slot, freq, res);
+      ledc_channel_config_t c = {};
+      c.gpio_num   = pin;
+      c.speed_mode = LEDC_LOW_SPEED_MODE;
+      c.channel    = (ledc_channel_t)(7 - slot);
+      c.intr_type  = LEDC_INTR_DISABLE;
+      c.timer_sel  = (ledc_timer_t)(3 - slot);
+      c.duty       = 0;
+      c.hpoint     = 0;
+      ledc_channel_config(&c);
+    } else if (res != fmLedcRes[slot]) {               // resolution change: re-init timer
+      fmLedcRes[slot] = res;
+      fmLedcTimerInit(slot, freq, res);
+    } else {                                           // retune only — deterministic
+      ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)(3 - slot), freq);
+    }
+    pwmMaxDuty[pin] = (1 << res) - 1;
+  }
+
+  /* Tone out (.tone pin): a 50%-duty LEDC square wave at `hz` (0 = silence). */
+  void toneOut(uint8_t pin, int hz) {
+    if (hz > 0) { ledcConfigure(pin, (uint32_t)hz, 8); fmPwmWrite(pin, 128); }
+    else        { fmPwmWrite(pin, 0); }
+    pinValues[pin] = hz;
+  }
+
   /* PWM_CONFIG (0x0E): pin, frequency Hz (3 x 7-bit LE, up to ~2 MHz), duty resolution
      in bits (1-14). Applies the LEDC config and puts the pin in PWM mode (mirrors
      SERVO_CONFIG's set-the-mode behaviour). On a passive buzzer the frequency IS the tone. */
@@ -695,32 +762,23 @@ class FirmataProtocol {
     if (res < 1) res = 1;
     if (res > 14) res = 14;
     if (freq <= 0) return;
-    int slot = fmLedcSlotOf(pin);
-    if (slot < 0) {                                    // first config: claim a slot
-      for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fmLedcPin[i] < 0) { slot = i; break; }
-      if (slot < 0) return;                            // all 4 slots busy
-      fmLedcPin[slot] = pin;
-      fmLedcRes[slot] = res;
-      fmLedcTimerInit(slot, (uint32_t)freq, res);
-      ledc_channel_config_t c = {};
-      c.gpio_num   = pin;
-      c.speed_mode = LEDC_LOW_SPEED_MODE;
-      c.channel    = (ledc_channel_t)(7 - slot);
-      c.intr_type  = LEDC_INTR_DISABLE;
-      c.timer_sel  = (ledc_timer_t)(3 - slot);
-      c.duty       = 0;
-      c.hpoint     = 0;
-      ledc_channel_config(&c);
-    } else if (res != fmLedcRes[slot]) {               // resolution change: re-init timer
-      fmLedcRes[slot] = res;
-      fmLedcTimerInit(slot, (uint32_t)freq, res);
-    } else {                                           // retune only — deterministic
-      ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)(3 - slot), (uint32_t)freq);
-    }
-    pwmMaxDuty[pin] = (1 << res) - 1;
+    ledcConfigure(pin, (uint32_t)freq, res);
     pinModes[pin] = PIN_MODE_PWM;
     pinValues[pin] = 0;
     pinConfigured[pin] = true;
+  }
+
+  /* TONE_CONFIG (0x0B): <pin> <freq:14-bit LE> <dur:14-bit LE>. Plays a square wave at
+     `freq` on a .tone pin (mode-gated); `dur` ms auto-stops via the tone timers, dur 0
+     is continuous, freq 0 stops. */
+  void handleTone(const uint8_t *data, int len) {
+    if (len < 5) return;
+    uint8_t pin = data[0];
+    if (pin >= TOTAL_PINS || pinModes[pin] != PIN_MODE_TONE) return;
+    int hz = (int)(data[1] & 0x7F) | ((int)(data[2] & 0x7F) << 7);
+    uint32_t dur = (uint32_t)(data[3] & 0x7F) | ((uint32_t)(data[4] & 0x7F) << 7);
+    toneOut(pin, hz);
+    if (hz > 0 && dur > 0) fmSetToneTimer(pin, dur); else fmClearToneTimer(pin);
   }
 
   void handleSetDigitalPinValue(uint8_t pin, uint8_t value) {
@@ -2154,6 +2212,7 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
     case STRING_DATA:           handleString(data, dlen);    break;
     case SERVO_CONFIG:          handleServoConfig(data, dlen); break;
     case PWM_CONFIG:            handlePwmConfig(data, dlen); break;
+    case TONE_CONFIG:           handleTone(data, dlen); break;
     case I2C_CONFIG:            handleI2CConfig(data, dlen);  break;
     case I2C_REQUEST:           handleI2CRequest(data, dlen); break;
     case SCHEDULER_DATA:        sched->handleSysex(data, dlen); break;
@@ -2234,6 +2293,8 @@ static void systemResetState() {
     pinConfigured[pin] = false;
   }
   moduleReset();       // the pin-mode reset above detaches RMT receivers — let modules re-arm
+  for (uint8_t pin = 0; pin < TOTAL_PINS; pin++) toneOffMs[pin] = 0;
+  toneTimersActive = 0;   // the pin reset stopped any tones
   samplingInterval = 19;
 }
 
@@ -2778,6 +2839,7 @@ void setup() {
 void loop() {
   transportPoll();
   moduleTick();
+  toneTick();               // auto-stop any timed tones (cheap when none pending)
 
   // Scheduler runs whether or not a client is connected — that is the whole
   // point: queue a task, disconnect, and the board keeps executing it.
