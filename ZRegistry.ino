@@ -4,7 +4,7 @@
 // visible here. The abstract ModuleHandler base lives in the main sketch (which
 // always concatenates first). Adding a module = one .ino + one array entry.
 
-static ModuleHandler *const modules[] = { &irModule, &sonarModule, &dhtModule, &displayModule };
+static ModuleHandler *const modules[] = { &irModule, &sonarModule, &dhtModule, &displayModule, &micModule };
 static const uint8_t MODULE_COUNT = sizeof(modules) / sizeof(modules[0]);
 
 static void moduleDispatch(uint8_t id, const uint8_t *payload, int length) {

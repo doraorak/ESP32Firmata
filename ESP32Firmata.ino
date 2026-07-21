@@ -19,11 +19,11 @@
 // --- Wi-Fi / Bonjour settings (used when ENABLE_WIFI == 1) -----------------
 #define WIFI_SSID          "YOUR_WIFI_SSID"
 #define WIFI_PASS          "YOUR_WIFI_PASSWORD"
-#define MDNS_HOSTNAME      "esp32-firmata"   // also the Bonjour instance name
+#define MDNS_HOSTNAME      "firmata-wifi-esp32"  // also the Bonjour instance name
 #define FIRMATA_TCP_PORT   3030              // must match BonjourTransport default
 
 // --- BLE settings (used when ENABLE_BLE == 1) -----------------------------
-#define BLE_DEVICE_NAME    "Firmata-ESP32"   // optional BLE name filter for clients
+#define BLE_DEVICE_NAME    "Firmata-BLE-ESP32"   // optional BLE name filter for clients
 
 #if !ENABLE_WIFI && !ENABLE_BLE
 #error "Enable at least one transport (ENABLE_WIFI and/or ENABLE_BLE)."
@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     21
+#define FIRMWARE_MINOR     23
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
