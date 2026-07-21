@@ -55,7 +55,7 @@ Everything else is the stock core (`WiFi`, `ESPmDNS`, `Wire`, `HTTPClient`).
 | Transport | Details |
 |---|---|
 | Wi-Fi | `_firmata._tcp` on port **3030**, instance `firmata-wifi-esp32` (TXT carries `ip`/`port`) |
-| BLE | Nordic UART Service, name `Firmata-BLE-ESP32` |
+| BLE | Nordic UART Service, name `firmata-ble-esp32` |
 | USB serial | 115200. Boots as the log console; the **first byte** a host sends claims the Firmata session and silences logging. |
 
 One master at a time, latest wins; the evicted client gets an `EVICTED` string

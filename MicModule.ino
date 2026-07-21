@@ -14,8 +14,10 @@
      0x00 <pin> <dbFReg> <rmsReg> <winLo> <winHi>            analog configure + windows (ms, >=50)
      0x01                                                    read now -> reply [0x01 ok db:5 rms:5]
      0x02 <offBits:5>                                        set calibration offset (dB, IEEE-754)
-     0x03 <bclk> <ws> <sd> <dbFReg> <rmsReg> <winLo> <winHi> I2S configure (INMP441) + windows
+     0x03 <bclk> <ws> <sd> <dbFReg> <rmsReg> <winLo> <winHi> [<rate:3>]  I2S configure (INMP441);
+                                                             optional 3x7-bit sample rate (default 16 kHz)
      0x04                                                    I2S diagnostic -> reply [0x04 peak:5]
+     0x05 <hzFReg | 0x7F>                                    I2S dominant-frequency (FFT) -> F[hzFReg]; 0x7F = off
    A window's burst blocks ~16 ms — same class as a sonar ping, fine at tick cadence. */
 
 #include "driver/i2s_std.h"    // I2S RX for digital MEMS mics (INMP441 etc.)
@@ -80,14 +82,79 @@ static int32_t micI2sPeakRaw() {
   return peak;
 }
 
+// Dominant frequency (Hz) of the I2S mic's left channel over a 512-sample window: Hann-window +
+// radix-2 FFT, biggest magnitude bin, parabolically interpolated. 0 = no bin dominates (peak not
+// >= 6x the mean), -1 = read error. Mirrors firmata_shim.cpp fm_i2s_mic_dominant_hz.
+static const int MIC_FFT_N = 512;
+static float micI2sDominantHz(int sampleRate) {
+  if (!micI2sRx) return -1;
+  static float re[MIC_FFT_N], im[MIC_FFT_N];
+  static int32_t rd[256];
+  const float kTwoPi = 6.283185307179586f;
+  int got = 0, attempts = 0;
+  while (got < MIC_FFT_N && attempts < 8) {                 // one DMA read is < 512 frames; collect
+    size_t br = 0;
+    if (i2s_channel_read(micI2sRx, rd, sizeof(rd), &br, 100) != ESP_OK) break;
+    int frames = (int)(br / sizeof(int32_t)) / 2;           // STEREO: 2 int32 per frame
+    for (int i = 0; i < frames && got < MIC_FFT_N; i++) { re[got] = (float)(rd[2 * i] >> 8); im[got] = 0.0f; got++; }
+    attempts++;
+  }
+  if (got < MIC_FFT_N) return -1;
+  double mean = 0; for (int i = 0; i < MIC_FFT_N; i++) mean += re[i]; mean /= MIC_FFT_N;
+  for (int i = 0; i < MIC_FFT_N; i++) {                     // DC-remove + Hann window
+    float w = 0.5f * (1.0f - cosf(kTwoPi * i / (MIC_FFT_N - 1)));
+    re[i] = (re[i] - (float)mean) * w;
+  }
+  for (int i = 1, j = 0; i < MIC_FFT_N; i++) {              // bit-reversal permutation
+    int bit = MIC_FFT_N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { float t; t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (int len = 2; len <= MIC_FFT_N; len <<= 1) {          // Cooley-Tukey butterflies
+    float ang = -kTwoPi / len, wlR = cosf(ang), wlI = sinf(ang);
+    for (int i = 0; i < MIC_FFT_N; i += len) {
+      float wR = 1, wI = 0;
+      for (int k = 0; k < len / 2; k++) {
+        int a = i + k, b = a + len / 2;
+        float vR = re[b] * wR - im[b] * wI, vI = re[b] * wI + im[b] * wR;
+        re[b] = re[a] - vR; im[b] = im[a] - vI;
+        re[a] += vR;        im[a] += vI;
+        float nwR = wR * wlR - wI * wlI; wI = wR * wlI + wI * wlR; wR = nwR;
+      }
+    }
+  }
+  int minBin = (int)(50.0f * MIC_FFT_N / sampleRate); if (minBin < 1) minBin = 1;   // ignore < 50 Hz
+  int maxBin = MIC_FFT_N / 2, peakBin = minBin;
+  float peakMag = -1; double magSum = 0;
+  for (int b = minBin; b < maxBin; b++) {
+    float m = re[b] * re[b] + im[b] * im[b];
+    magSum += m;
+    if (m > peakMag) { peakMag = m; peakBin = b; }
+  }
+  double meanMag = magSum / (maxBin - minBin);
+  if (peakMag < 6.0 * meanMag) return 0;                   // no bin dominates -> no tone
+  float delta = 0;                                         // parabolic peak interpolation
+  if (peakBin > minBin && peakBin < maxBin - 1) {
+    float a = re[peakBin-1]*re[peakBin-1] + im[peakBin-1]*im[peakBin-1];
+    float b = peakMag;
+    float c = re[peakBin+1]*re[peakBin+1] + im[peakBin+1]*im[peakBin+1];
+    float d = a - 2*b + c;
+    if (d != 0) delta = 0.5f * (a - c) / d;
+  }
+  return (peakBin + delta) * (float)sampleRate / MIC_FFT_N;
+}
+
 struct MicModuleHandler : ModuleHandler {
   uint8_t id()    const override { return 0x05; }
   uint8_t major() const override { return 1; }
-  uint8_t minor() const override { return 1; }   // 1.1: op 0x03 I2S MEMS-mic mode
+  uint8_t minor() const override { return 2; }   // 1.2: I2S sample rate + op 0x05 dominant frequency
   const char *name() const override { return "mic"; }
 
   int      pin = -1;                 // -1 = unconfigured (analog)
   bool     i2sMode = false;          // true = digital I2S mic (INMP441), pin ignored
+  int      sampleRate = 16000;       // I2S audio rate (Hz); host-settable, drives Hz mapping
+  int      hzFReg = -1;              // -1 = dominant-frequency detection off (I2S only)
   int      dbFReg = 0;
   int      rmsReg = 0;
   uint32_t windowMs = 250;
@@ -138,14 +205,21 @@ struct MicModuleHandler : ModuleHandler {
           nextWindowMs = millis();
         }
         break;
-      case 0x03:                    // I2S configure: bclk, ws, sd, F[db], R[rms], window ms
+      case 0x03:                    // I2S configure: bclk, ws, sd, F[db], R[rms], winLo, winHi, [rate:3]
         if (length >= 8) {
           dbFReg  = payload[4] & 0x0F;
           rmsReg  = payload[5] & 0x1F;
           windowMs = (uint32_t)(payload[6] & 0x7F) | ((uint32_t)(payload[7] & 0x7F) << 7);
           if (windowMs < 50) windowMs = 50;
-          if (micI2sBegin(payload[1] & 0x7F, payload[2] & 0x7F, payload[3] & 0x7F, 16000)) {
+          int rate = 16000;                          // default; optional 3x7-bit rate follows
+          if (length >= 11)
+            rate = (int)((uint32_t)(payload[8] & 0x7F) | ((uint32_t)(payload[9] & 0x7F) << 7)
+                         | ((uint32_t)(payload[10] & 0x7F) << 14));
+          if (rate < 8000) rate = 8000;
+          if (rate > 48000) rate = 48000;
+          if (micI2sBegin(payload[1] & 0x7F, payload[2] & 0x7F, payload[3] & 0x7F, rate)) {
             i2sMode = true; pin = -1;
+            sampleRate = rate;
             nextWindowMs = millis();
           }
         }
@@ -184,6 +258,9 @@ struct MicModuleHandler : ModuleHandler {
         sendFrame(out, n);
         break;
       }
+      case 0x05:                    // enable/disable dominant-frequency (I2S) -> F[hzFReg]; 0x7F = off
+        if (length >= 2) hzFReg = (payload[1] == 0x7F) ? -1 : (payload[1] & 0x0F);
+        break;
       default: break;
     }
   }
@@ -197,11 +274,15 @@ struct MicModuleHandler : ModuleHandler {
       scheduler.fregs[dbFReg] = decibels(rms);
       scheduler.regs[rmsReg] = (int32_t)rms;
     }
+    if (i2sMode && hzFReg >= 0) {
+      float hz = micI2sDominantHz(sampleRate);
+      if (hz >= 0) scheduler.fregs[hzFReg] = hz;   // 0 = no dominant tone; <0 = read error (skip)
+    }
     nextWindowMs = now + windowMs;
   }
 
   void reset() override {
-    pin = -1; i2sMode = false;        // offsetDb kept: calibration outlives sessions
+    pin = -1; i2sMode = false; hzFReg = -1;   // offsetDb kept: calibration outlives sessions
   }
 };
 static MicModuleHandler micModule;

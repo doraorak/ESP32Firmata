@@ -23,7 +23,7 @@
 #define FIRMATA_TCP_PORT   3030              // must match BonjourTransport default
 
 // --- BLE settings (used when ENABLE_BLE == 1) -----------------------------
-#define BLE_DEVICE_NAME    "Firmata-BLE-ESP32"   // optional BLE name filter for clients
+#define BLE_DEVICE_NAME    "firmata-ble-esp32"   // optional BLE name filter for clients
 
 #if !ENABLE_WIFI && !ENABLE_BLE
 #error "Enable at least one transport (ENABLE_WIFI and/or ENABLE_BLE)."
@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     23
+#define FIRMWARE_MINOR     24
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
