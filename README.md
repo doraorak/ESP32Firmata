@@ -97,7 +97,7 @@ a module is one class plus one array entry.
 | `0x02` | `sonar` | HC-SR04/US-100 distance → register (one-shot + auto-ping) |
 | `0x03` | `dht` | DHT11/DHT22 → float registers (°C, %RH) + ok flag, 2 s auto-refresh |
 | `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 or compact 4×6 font — prints text/registers/strings, wraps long lines |
-| `0x05` | `mic` | Sound level from an **analog** mic or a **digital I²S MEMS** mic (INMP441) — on-device RMS windows → dB float register + raw-RMS register, one-shot read, stored dB calibration offset |
+| `0x05` | `mic` | Sound level from an **analog** mic or a **digital I²S MEMS** mic (INMP441) — on-device RMS windows → dB float register + raw-RMS register, one-shot read, stored dB calibration; I²S adds settable sample rate + on-device dominant-frequency (FFT) → Hz register |
 
 The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`)
 with NEC/RC6/Coolix encoded host-side (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR));
