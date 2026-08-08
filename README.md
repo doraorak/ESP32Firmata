@@ -121,7 +121,7 @@ A live-only debug channel — the host reads and writes the chip's RAM directly.
 
 ```
 READ        F0 0F 00 <addr:5> <count:5>                              F7
-WRITE       F0 0F 01 <addr:5> <byte-pairs…>                          F7
+WRITE       F0 0F 01 <addr:5> <nLo> <nHi> <byte-pairs…>              F7
 INFO        F0 0F 02                                                 F7
 READ_REPLY  F0 0F 7F <ok> <addr:5> <nLo> <nHi> <byte-pairs…>         F7
 INFO_REPLY  F0 0F 7E <free:5> <total:5> <minFree:5> <dramLo:5> <dramHi:5> F7
