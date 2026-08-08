@@ -96,7 +96,7 @@ a module is one class plus one array entry.
 | `0x01` | `ir` | Infrared transmit (NEC/RC6/Coolix/raw) + receive (NEC/RC6/Coolix, or raw timings as text) + sniffing over RMT |
 | `0x02` | `sonar` | HC-SR04/US-100 distance → register (one-shot + auto-ping) |
 | `0x03` | `dht` | DHT11/DHT22 → float registers (°C, %RH) + ok flag, 2 s auto-refresh |
-| `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 or compact 4×6 font — prints text/registers/strings, wraps long lines |
+| `0x04` | `display` | SSD1306/SH1106 128×64 OLED, 5×7 or compact 4×6 font — prints text/registers/strings, wraps long lines; single pixels, page blits, whole frames, and four bitmap slots a task draws by index |
 | `0x05` | `mic` | Sound level from an **analog** mic or a **digital I²S MEMS** mic (INMP441) — on-device RMS windows → dB float register + raw-RMS register, one-shot read, stored dB calibration; I²S adds settable sample rate + on-device dominant-frequency (FFT) → Hz register |
 
 The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`)
@@ -106,6 +106,38 @@ register. Receive (`0x02 <pin> <reg> [<protocol>]`) decodes NEC, RC6 mode 0, or 
 one shared raw RMT capture; raw-capture mode (`0x06`) mirrors every burst to the host as
 timings for protocol sniffing, and `0x08` writes a burst's timings as text into a device
 string slot. Drive the LED at 5 V, keep the receiver on 3.3 V.
+
+The display module draws as well as prints. I²C is write-only, so the firmware keeps a 1 KB
+shadow of panel RAM (8 pages × 128 columns, one byte = 8 *vertical* pixels, bit 0 topmost) and
+serves `0x06 <xLo> <xHi> <y> <on>` (one pixel) as a real read-modify-write; `0x07 <page> <colLo>
+<colHi> <bytes…>` blits raw page bytes, and a full 128×64 frame is 8 of those because one SysEx
+carries at most `SYSEX_MAX` (512). Four **bitmap slots** hold whole frames in RAM: `0x08 <slot>
+<page> <bytes…>` stores a page, `0x09 <slot>` draws the slot. That is what makes drawings usable
+from tasks — an inlined frame costs ~2 KB of the task budget, a slot draw costs 2 bytes.
+
+## Raw memory (`MEMORY_DATA 0x0F`)
+
+A live-only debug channel — the host reads and writes the chip's RAM directly. No task ops.
+
+```
+READ        F0 0F 00 <addr:5> <count:5>                              F7
+WRITE       F0 0F 01 <addr:5> <byte-pairs…>                          F7
+INFO        F0 0F 02                                                 F7
+READ_REPLY  F0 0F 7F <ok> <addr:5> <nLo> <nHi> <byte-pairs…>         F7
+INFO_REPLY  F0 0F 7E <free:5> <total:5> <minFree:5> <dramLo:5> <dramHi:5> F7
+```
+
+`<addr>`/counts are Int32 as 5 Encoder7Bit bytes; each data byte travels as two 7-bit halves
+(low 7 bits, then bit 7), so `n` bytes cost `2n` on the wire and one request tops out at
+**224 bytes**.
+
+Reads are range-checked against the SoC's mapped windows — internal DRAM, memory-mapped flash
+(read-only) and RTC data — and refused with `ok = 0` rather than executed. That check is
+load-bearing: an unmapped load raises `LoadProhibited` and reboots the chip, and a host-side hex
+browser will walk wherever the user scrolls. Writes are checked for writability (flash is
+rejected) but are otherwise unguarded — they land in live RAM next to the firmware, the task VM
+and the network stack, so a wrong address can corrupt the running program or reboot the board.
+Nothing here is persistent; a power cycle always recovers.
 
 ## Pin map (typical ESP32 dev board)
 

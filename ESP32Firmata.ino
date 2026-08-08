@@ -32,7 +32,7 @@
 // --- Firmware identity (sent in the firmware-report message) --------------
 #define FIRMWARE_NAME      "FirmataESP32"
 #define FIRMWARE_MAJOR     2
-#define FIRMWARE_MINOR     24
+#define FIRMWARE_MINOR     27
 #define PROTOCOL_MAJOR     2
 #define PROTOCOL_MINOR     8
 
@@ -177,6 +177,22 @@ static const int32_t ST_ALLOC_FAILED  = 5;
    override the compile-time WIFI_SSID/WIFI_PASS on the next boot. */
 static const uint8_t MODULE_DATA       = 0x0D;  // module subsystem (user-range SysEx)
 static const uint8_t PWM_CONFIG        = 0x0E;  // per-pin LEDC freq/resolution (user-range SysEx)
+/* Raw memory inspection (user-range SysEx). One command with sub-ops, like WIFI_CONFIG:
+     0x00 <addr:5> <n:2>                   host->dev: read n bytes at addr
+     0x01 <addr:5> <n:2> <data 8/7>        host->dev: write n bytes at addr
+     0x02                                  host->dev: heap + DRAM-range query
+     0x7F <ok> <addr:5> <n:2> <data 8/7>   dev->host: read reply (ok 0 = refused, bad range)
+     0x7E <free:5> <total:5> <min:5> <dramLo:5> <dramHi:5>   dev->host: info reply
+   Reads are RANGE-CHECKED: the host's browser walks wherever the user scrolls, and a load
+   from an unmapped address panics the chip. Writes are not otherwise guarded - clobbering
+   live state can crash the firmware, by design. */
+static const uint8_t MEMORY_DATA       = 0x0F;
+static const uint8_t MEM_READ          = 0x00;
+static const uint8_t MEM_WRITE         = 0x01;
+static const uint8_t MEM_INFO          = 0x02;
+static const uint8_t MEM_READ_REPLY    = 0x7F;
+static const uint8_t MEM_INFO_REPLY    = 0x7E;
+static const int     MEM_MAX_CHUNK     = 224;   // reply must fit SYSEX_MAX: 11 + 2n
 static const uint8_t TONE_CONFIG       = 0x0B;  // <pin> <freq:14b> <dur:14b>: tone on a .tone pin
 static const uint8_t MODULE_QUERY      = 0x00;
 static const uint8_t MODULE_LIST_REPLY = 0x7F;
@@ -2184,6 +2200,86 @@ class Scheduler {
 
 // Now that Scheduler is complete, define the handler's scheduler-dispatching SysEx.
 #if ENABLE_WIFI
+
+/* ==== Raw memory (MEMORY_DATA 0x0F) — mirrors ESP32FirmataSwift ==================== */
+static bool memRangeIn(uint32_t addr, int len, uint32_t low, uint32_t high) {
+  if (len <= 0) return false;
+  uint64_t end = (uint64_t)addr + (uint64_t)len;          // 64-bit: cannot wrap
+  return addr >= low && end <= (uint64_t)high;
+}
+static bool memReadable(uint32_t a, int n) {
+  return memRangeIn(a, n, SOC_DRAM_LOW, SOC_DRAM_HIGH) ||
+         memRangeIn(a, n, SOC_DROM_LOW, SOC_DROM_HIGH) ||
+         memRangeIn(a, n, SOC_RTC_DATA_LOW, SOC_RTC_DATA_HIGH);
+}
+static bool memWritable(uint32_t a, int n) {
+  return memRangeIn(a, n, SOC_DRAM_LOW, SOC_DRAM_HIGH) ||
+         memRangeIn(a, n, SOC_RTC_DATA_LOW, SOC_RTC_DATA_HIGH);
+}
+static uint32_t memDecode5(const uint8_t *d, int at) {
+  uint32_t v = 0;
+  for (int i = 4; i >= 0; i--) v = (v << 7) | (uint32_t)(d[at + i] & 0x7F);
+  return v;
+}
+static int memAppend5(uint8_t *out, int n, uint32_t v) {
+  for (int i = 0; i < 5; i++) { out[n++] = (uint8_t)(v & 0x7F); v >>= 7; }
+  return n;
+}
+static void handleMemory(const uint8_t *data, int dlen) {
+  if (dlen < 1) return;
+  switch (data[0]) {
+    case MEM_READ: {
+      if (dlen < 8) return;
+      uint32_t addr = memDecode5(data, 1);
+      int n = (data[6] & 0x7F) | ((data[7] & 0x7F) << 7);
+      if (n > MEM_MAX_CHUNK) n = MEM_MAX_CHUNK;
+      bool ok = n > 0 && memReadable(addr, n);
+      int i = 0;
+      frameBuf[i++] = START_SYSEX; frameBuf[i++] = MEMORY_DATA;
+      frameBuf[i++] = MEM_READ_REPLY; frameBuf[i++] = ok ? 1 : 0;
+      i = memAppend5(frameBuf, i, addr);
+      frameBuf[i++] = (uint8_t)(n & 0x7F); frameBuf[i++] = (uint8_t)((n >> 7) & 0x7F);
+      if (ok) {
+        const volatile uint8_t *src = (const volatile uint8_t *)(uintptr_t)addr;
+        for (int k = 0; k < n; k++) {
+          uint8_t b = src[k];
+          frameBuf[i++] = b & 0x7F; frameBuf[i++] = (b >> 7) & 0x01;
+        }
+      }
+      frameBuf[i++] = END_SYSEX;
+      sendFrame(frameBuf, i);
+      break;
+    }
+    case MEM_WRITE: {
+      if (dlen < 8) return;
+      uint32_t addr = memDecode5(data, 1);
+      int n = (data[6] & 0x7F) | ((data[7] & 0x7F) << 7);
+      int avail = (dlen - 8) / 2; if (avail < 0) avail = 0;
+      if (n > avail) n = avail;
+      if (n > MEM_MAX_CHUNK) n = MEM_MAX_CHUNK;
+      if (n > 0 && memWritable(addr, n)) {
+        volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)addr;
+        for (int k = 0; k < n; k++)
+          dst[k] = (uint8_t)((data[8 + k * 2] & 0x7F) | ((data[9 + k * 2] & 0x01) << 7));
+      }
+      break;
+    }
+    case MEM_INFO: {
+      int i = 0;
+      frameBuf[i++] = START_SYSEX; frameBuf[i++] = MEMORY_DATA; frameBuf[i++] = MEM_INFO_REPLY;
+      i = memAppend5(frameBuf, i, (uint32_t)ESP.getFreeHeap());
+      i = memAppend5(frameBuf, i, (uint32_t)ESP.getHeapSize());
+      i = memAppend5(frameBuf, i, (uint32_t)ESP.getMinFreeHeap());
+      i = memAppend5(frameBuf, i, (uint32_t)SOC_DRAM_LOW);
+      i = memAppend5(frameBuf, i, (uint32_t)SOC_DRAM_HIGH);
+      frameBuf[i++] = END_SYSEX;
+      sendFrame(frameBuf, i);
+      break;
+    }
+    default: break;
+  }
+}
+
 static void handleWiFiConfig(const uint8_t *data, int dlen);   // defined in the Wi-Fi section
 #endif
 
@@ -2197,6 +2293,7 @@ void FirmataProtocol::processSysex(const uint8_t *buf, int len) {
 #if ENABLE_WIFI
     case MODULE_DATA:           handleModuleData(data, dlen);  break;
     case WIFI_CONFIG:           handleWiFiConfig(data, dlen);  break;
+    case MEMORY_DATA:           handleMemory(data, dlen);      break;
 #endif
     case REPORT_FIRMWARE:       sendFirmwareReport();        break;
     case CAPABILITY_QUERY:      sendCapabilityResponse();    break;

@@ -65,18 +65,56 @@ static const uint8_t DISPLAY_TINY[] = {
      0x02 <line> <col> <len:2> <text>   print literal 7-bit ASCII
      0x03 <line> <col> <slot>           print snapshot/string slot content (0-11)
      0x04 <line> <col> <reg>            print R[reg] as decimal
-     0x05 <line> <col> <freg>           print F[freg] with 2 decimals            */
+     0x05 <line> <col> <freg>           print F[freg] with 2 decimals
+     0x06 <x:2> <y> <on>                set/clear ONE pixel (x 0-127, y 0-63)
+     0x07 <page> <col:2> <n:2> <data>   blit `n` raw column bytes into `page` (8/7-encoded)
+     0x08 <slot> <page> <n:2> <data>    store one page of a frame into bitmap SLOT (8/7-encoded)
+     0x09 <slot>                        draw stored bitmap SLOT to the panel
+
+   BITMAP SLOTS. Embedding a frame in a task costs 1024 B of the 4096 B budget, so a drawing
+   step is stored out-of-band: the host uploads the frame once into a slot (op 0x08, one
+   message per page) and the task carries only `0x09 <slot>` - TWO bytes, constant, however
+   complex the picture.
+
+   PIXELS. Panel RAM is 8 pages x 128 columns, one byte = 8 *vertical* pixels, and
+   SSD1306/SH1106 over I2C is write-only - a byte can't be read back to flip one bit.
+   So the module keeps a 1024-byte shadow (`fb`); every write path records into it and
+   setPixel does read-modify-write against the shadow. A full 128x64 frame is 1024 bytes
+   (over SYSEX_MAX even before encoding), so a frame arrives as 8 page-blits.          */
 struct DisplayModuleHandler : ModuleHandler {
   uint8_t id()    const override { return 0x04; }
   uint8_t major() const override { return 1; }
-  uint8_t minor() const override { return 0; }
+  uint8_t minor() const override { return 2; }   // 1.2: bitmap slots (0x08/0x09)
   const char *name() const override { return "display"; }
 
   static const int LINES = 8;
+  static const int WIDTH = 128;
   int     addr = -1;                        // -1 = unconfigured
   int     colOffset = 0;                    // SH1106 panels: 132-col RAM, glass at cols 2-129 -> offset 2
   bool    smallFont = false;                // configure flag: 4x6 tiny font (25 cols) vs 5x7 (21 cols)
   uint8_t lineBuf[25];                      // reused per print; sized for the tiny font
+  // Shadow of the panel RAM (page-major, 8 x 128) so one pixel can be updated without
+  // reading the panel; curPage/curCol track where the panel's write pointer is.
+  uint8_t fb[8 * 128];
+  int     curPage = 0, curCol = 0;
+  /* Stored frames a task can draw by index; keeps a drawing out of the task budget.
+     HEAP, not a static array: 4 KB of .bss overflows dram0_0_seg on this build, while the
+     heap has plenty. Allocated on first use so a sketch that never draws pays nothing.
+     (The Swift firmware needs no equivalent — its [UInt8] is already heap-backed.) */
+  static const int SLOTS = 4;
+  uint8_t *slots = nullptr;
+
+  bool ensureSlots() {
+    if (!slots) slots = (uint8_t *)calloc(SLOTS * 8 * 128, 1);
+    return slots != nullptr;
+  }
+
+  inline void track(uint8_t byte) {
+    if (curPage >= 0 && curPage < LINES && curCol >= 0 && curCol < WIDTH)
+      fb[curPage * WIDTH + curCol] = byte;
+    curCol++;
+  }
+
   // Glyph metrics switch with the font (normal 5x7 in a 6-px cell / tiny 4x6 in a 5-px cell).
   int cellPx()    const { return smallFont ? 5 : 6; }
   int glyphCols() const { return smallFont ? 4 : 5; }
@@ -95,6 +133,8 @@ struct DisplayModuleHandler : ModuleHandler {
     cmd(0xB0 | (line & 0x07));              // page
     cmd(0x00 | (c & 0x0F));                 // column low nibble
     cmd(0x10 | ((c >> 4) & 0x0F));          // column high nibble
+    curPage = line & 0x07;                  // shadow follows the panel's write pointer
+    curCol = colPx;
   }
 
   // Stream `count` blank columns (clear covers the full 132-col RAM so SH1106 edge
@@ -109,6 +149,7 @@ struct DisplayModuleHandler : ModuleHandler {
         chunkLeft = 24;
       }
       Wire.write((uint8_t)0);
+      track(0);
       written++; chunkLeft--;
     }
     if (written > 0) Wire.endTransmission(true);
@@ -132,6 +173,7 @@ struct DisplayModuleHandler : ModuleHandler {
         if (k < glyphW && inRange)
           byte = smallFont ? DISPLAY_TINY[(c - 0x20) * 4 + k] : DISPLAY_FONT[(c - 0x20) * 5 + k];
         Wire.write(byte);
+        track(byte);
         written++; chunkLeft--;
       }
     }
@@ -175,7 +217,40 @@ struct DisplayModuleHandler : ModuleHandler {
     colOffset = 0;                          // clear the whole RAM from absolute column 0
     for (int line = 0; line < LINES; line++) { setCursor(line, 0); writeBlank(132); }
     colOffset = saved;
+    memset(fb, 0, sizeof(fb));              // writeBlank's tracking stops at 128; zero the rest
     setCursor(0, 0);
+  }
+
+  // ---- pixels ----
+
+  // Push `count` shadow bytes of `page` starting at `col` out to the panel.
+  void flushRun(int page, int col, int count) {
+    if (addr < 0 || count <= 0) return;
+    setCursor(page, col);
+    int written = 0, chunkLeft = 0;
+    for (int i = 0; i < count; i++) {
+      if (chunkLeft == 0) {
+        if (written > 0) Wire.endTransmission(true);
+        Wire.beginTransmission((uint8_t)addr);
+        Wire.write((uint8_t)0x40);
+        chunkLeft = 24;
+      }
+      Wire.write(fb[page * WIDTH + col + i]);
+      written++; chunkLeft--;
+    }
+    if (written > 0) Wire.endTransmission(true);
+    curCol = col + count;                   // panel auto-incremented; keep the shadow in step
+  }
+
+  // One pixel: read-modify-write the shadow byte, then re-send just that byte.
+  void setPixel(int x, int y, bool on) {
+    if (addr < 0 || x < 0 || x >= WIDTH || y < 0 || y >= LINES * 8) return;
+    int page = y >> 3, idx = page * WIDTH + x;
+    uint8_t mask = (uint8_t)(1 << (y & 7));
+    uint8_t updated = on ? (uint8_t)(fb[idx] | mask) : (uint8_t)(fb[idx] & ~mask);
+    if (updated == fb[idx]) return;         // already in that state - skip the I2C round trip
+    fb[idx] = updated;
+    flushRun(page, x, 1);
   }
 
   // Write `value` as decimal into lineBuf[at...]; returns the new length.
@@ -251,6 +326,32 @@ struct DisplayModuleHandler : ModuleHandler {
           if (i < cols()) lineBuf[i++] = (uint8_t)(frac / 10) + 0x30;
           if (i < cols()) lineBuf[i++] = (uint8_t)(frac % 10) + 0x30;
           flushLine(line, col, i);
+        }
+        break;
+      case 0x06:                            // set pixel: x:2, y, on
+        if (length >= 5) {
+          int x = (payload[1] & 0x7F) | ((payload[2] & 0x7F) << 7);
+          setPixel(x, payload[3] & 0x7F, (payload[4] & 0x7F) != 0);
+        }
+        break;
+      case 0x07:                            // blit page: page, col:2, n:2, data (8/7-encoded)
+        if (length >= 6) {
+          int page = payload[1] & 0x07;
+          int col  = (payload[2] & 0x7F) | ((payload[3] & 0x7F) << 7);
+          int want = (payload[4] & 0x7F) | ((payload[5] & 0x7F) << 7);
+          // Each display byte arrives as two 7-bit halves (low 7 bits, then bit 7).
+          int avail = (length - 6) / 2;
+          if (avail < 0) avail = 0;
+          int n = want < avail ? want : avail;
+          if (col < 0 || col >= WIDTH) break;
+          if (col + n > WIDTH) n = WIDTH - col;
+          if (n <= 0) break;
+          for (int i = 0; i < n; i++) {
+            uint8_t lo = payload[6 + i * 2] & 0x7F;
+            uint8_t hi = payload[7 + i * 2] & 0x01;
+            fb[page * WIDTH + col + i] = (uint8_t)(lo | (hi << 7));
+          }
+          flushRun(page, col, n);
         }
         break;
       default: break;
